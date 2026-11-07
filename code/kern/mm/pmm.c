@@ -1,7 +1,5 @@
 #include <default_pmm.h>
 #include <best_fit_pmm.h>
-#include <buddy_pmm.h>
-#include <slub_pmm.h>
 #include <defs.h>
 #include <error.h>
 #include <memlayout.h>
@@ -10,6 +8,7 @@
 #include <sbi.h>
 #include <stdio.h>
 #include <string.h>
+#include <../sync/sync.h>
 #include <riscv.h>
 #include <dtb.h>
 
@@ -31,14 +30,18 @@ uintptr_t satp_physical;
 // physical memory management
 const struct pmm_manager *pmm_manager;
 
+/* lab3 的 memlayout.h 只保留了 PHYSICAL_MEMORY_OFFSET，删掉了 lab2 里的
+ * PHYSICAL_MEMORY_END。这里用 KERNTOP 换算出物理地址上界：
+ * 0xFFFFFFFFC8000000 - 0xFFFFFFFF40000000 = 0x88000000。
+ * 保持 lab2 的 page_init 逻辑不变，只在本地补一个宏。 */
+#define PHYSICAL_MEMORY_END (KERNTOP - PHYSICAL_MEMORY_OFFSET)
+
 
 static void check_alloc_page(void);
 
 // init_pmm_manager - initialize a pmm_manager instance
 static void init_pmm_manager(void) {
-    // 任务二：Best-Fit；任务三：Buddy System。
-    // 两者都实现了 struct pmm_manager 的七个成员，切换只改这一行的指向。
-    pmm_manager = &buddy_pmm_manager;
+    pmm_manager = &best_fit_pmm_manager;
     cprintf("memory management: %s\n", pmm_manager->name);
     pmm_manager->init();
 }
@@ -51,20 +54,40 @@ static void init_memmap(struct Page *base, size_t n) {
 // alloc_pages - call pmm->alloc_pages to allocate a continuous n*PAGESIZE
 // memory
 struct Page *alloc_pages(size_t n) {
-    return pmm_manager->alloc_pages(n);
+    struct Page *page = NULL;
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        page = pmm_manager->alloc_pages(n);
+    }
+    local_intr_restore(intr_flag);
+    return page;
 }
 
 // free_pages - call pmm->free_pages to free a continuous n*PAGESIZE memory
 void free_pages(struct Page *base, size_t n) {
-    pmm_manager->free_pages(base, n);
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        pmm_manager->free_pages(base, n);
+    }
+    local_intr_restore(intr_flag);
 }
 
 // nr_free_pages - call pmm->nr_free_pages to get the size (nr*PAGESIZE)
 // of current free memory
 size_t nr_free_pages(void) {
-    return pmm_manager->nr_free_pages();
+    size_t ret;
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        ret = pmm_manager->nr_free_pages();
+    }
+    local_intr_restore(intr_flag);
+    return ret;
 }
 
+//lab2 请补充你在lab2中的代码
 //lab2 function1 2510538
 
 /* page_init - detect physical memory space, reserve already used memory,
@@ -132,9 +155,6 @@ void pmm_init(void) {
     satp_virtual = (pte_t*)boot_page_table_sv39;
     satp_physical = PADDR(satp_virtual);
     cprintf("satp virtual address: 0x%016lx\nsatp physical address: 0x%016lx\n", satp_virtual, satp_physical);
-
-    // 扩展 Challenge：任意大小内存对象（slub）分配的自测
-    slub_test();
 }
 
 static void check_alloc_page(void) {

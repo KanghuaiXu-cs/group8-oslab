@@ -1,9 +1,0 @@
-obj/
-bin/
-*.o
-*.d
-*.asm
-*.sym
-*.out
-.gdb.in
-.qemu.out
