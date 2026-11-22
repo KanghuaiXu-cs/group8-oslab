@@ -239,7 +239,9 @@ pte_t *get_pte(pde_t *pgdir, uintptr_t la, bool create)
         set_page_ref(page, 1);
         uintptr_t pa = page2pa(page);
         memset(KADDR(pa), 0, PGSIZE);
-        *pdep1 = pte_create(page2ppn(page), PTE_U | PTE_V);
+        /* [QEMU10 兼容] RISC-V 规范要求非叶子 PTE 的 D/A/U 保留位为 0；
+     * QEMU 10 会强制检查（4.1.1 不检查），带 U 会让新映射一访问就缺页。 */
+        *pdep1 = pte_create(page2ppn(page), PTE_V);
     }
     pde_t *pdep0 = &((pte_t *)KADDR(PDE_ADDR(*pdep1)))[PDX0(la)];
     if (!(*pdep0 & PTE_V))
@@ -252,7 +254,9 @@ pte_t *get_pte(pde_t *pgdir, uintptr_t la, bool create)
         set_page_ref(page, 1);
         uintptr_t pa = page2pa(page);
         memset(KADDR(pa), 0, PGSIZE);
-        *pdep0 = pte_create(page2ppn(page), PTE_U | PTE_V);
+        /* [QEMU10 兼容] RISC-V 规范要求非叶子 PTE 的 D/A/U 保留位为 0；
+     * QEMU 10 会强制检查（4.1.1 不检查），带 U 会让新映射一访问就缺页。 */
+        *pdep0 = pte_create(page2ppn(page), PTE_V);
     }
     return &((pte_t *)KADDR(PDE_ADDR(*pdep0)))[PTX(la)];
 }
@@ -390,7 +394,9 @@ static void check_pgdir(void)
     assert((ptep = get_pte(boot_pgdir_va, PGSIZE, 0)) != NULL);
     assert(*ptep & PTE_U);
     assert(*ptep & PTE_W);
-    assert(boot_pgdir_va[0] & PTE_U);
+    /* [QEMU10 兼容] 原断言要求中间级页表项带 U，与非叶子 PTE 的规范冲突，
+     * 这里改为只检查该项有效。 */
+    assert(boot_pgdir_va[0] & PTE_V);
     assert(page_ref(p2) == 1);
 
     assert(page_insert(boot_pgdir_va, p1, PGSIZE, 0) == 0);
