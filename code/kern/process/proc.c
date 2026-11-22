@@ -468,6 +468,44 @@ lab4 里所有内核线程共享同一张 boot_pgdir，所以这里写进去的�
 以及不能用 libs/riscv.h 的 lsatp()——那是 Sv32 的写法（SATP32_MODE 在 bit 31），
 Sv39 的 MODE 在 bit 63..60 且值为 8。*/
 
+//---- 答辩问答（对应 cpu_idle / proc_run） ----
+/*Q1：cpu_idle 和 idleproc 是一回事吗？
+A ：不是。idleproc 是 0 号线程的 PCB（数据），cpu_idle 是它执行的函数（代码）。
+    关系是：kern_init 最后调用 cpu_idle()，此时 current 就是 idleproc，
+    也就是“idleproc 这个线程正在跑 cpu_idle 这个函数”。
+    idleproc 特殊在它是复用启动现场造的（kstack = bootstack、没有自己的 trapframe），
+    所以它不会被 forkret 启动；它被切走再切回来时，switch_to 恢复的是它自己在
+    proc_run 里的返回地址，于是继续跑 cpu_idle 的循环。
+
+Q2：forkret 是什么？为什么新线程要从它开始？
+A ：proc.c 里的 static 函数：forkret() { forkrets(current->tf); }。
+    copy_thread 把新线程的 context.ra 设成 forkret，所以 switch_to 的 ret 一跳就到这里；
+    forkret 再把新线程的 trapframe 交给 trapentry.S 的 forkrets（sp = a0; j __trapret），
+    由 __trapret + sret 跳进 tf->epc = kernel_thread_entry，线程函数才开始执行。
+    注意此刻 current 已经在 proc_run 里改成新线程，所以 current->tf 是新线程自己的。
+
+Q3：为什么 prev = current 必须在 current = proc 之前？
+A ：switch_to 需要“旧线程的 context 地址”来保存现场；先改 current 就把旧线程指针丢了，
+    现场无处可存，旧线程以后再也回不来。
+
+Q4：satp 那一句的四个小问
+   (a) 为什么要 >> 12？
+       pgdir 存的是页目录的物理地址，而 satp 的 PPN 要的是“第几页”；
+       一页 4KB = 2^12，所以右移 12 位等于除以 4096。这不是对齐。
+   (b) 为什么不能用 libs/riscv.h 的 lsatp()？
+       它是 Sv32 写法：SATP32_MODE = 0x80000000 把 MODE 放在 bit 31（Sv32 只有 1 位）；
+       Sv39 的 MODE 是 4 位、在 bit 63..60、值为 8。用它会写坏 MODE 字段，页表直接失效。
+   (c) flush_tlb() 能省吗？
+       不能。换了 satp，但 TLB 里可能还缓存着旧地址空间的翻译，
+       会出现“查的是新页表、访问却落到旧物理页”的情况。
+   (d) 内核线程共用 boot_pgdir，这一句能删吗？
+       不能。“切换进程 = 切换地址空间”是语义要求；现在值相同只是巧合，
+       将来有独立地址空间的用户进程时，它就是唯一正确的来源。
+
+Q5：local_intr_restore(intr_flag) 这一行，新创建的线程会执行到吗？
+A ：不会。新线程从 forkret 开始跑，走的是另一条路；这一行只有“被切走又被切回来”的
+    线程才会执行，而且用的是它自己那份 proc_run 栈帧里的 intr_flag。*/
+
 /* cpu_idle - 空闲线程（idleproc）的执行主体
  *
  * kern_init() 的最后一步就是调用它，所以正常情况下它永远不返回

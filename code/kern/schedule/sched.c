@@ -20,6 +20,20 @@ wakeup_proc(struct proc_struct *proc) {
 为什么要兜底 idleproc：所有线程都可能正在睡，此时若 next 为 NULL，后面 next->runs++ 直接空指针崩溃；
 idleproc 永远可运行，用它保证“CPU 永远有活干”。*/
 
+/* ---- 答辩问答（对应本函数） ----
+ * Q1：第一句 current->need_resched = 0 是干什么的？删掉会怎样？
+ * A ：清掉“本次调度请求”。不清的话，线程刚被切回来又看到请求，立刻再切走，
+ *     表现为空转：runs 疯涨、几乎没有线程真正执行。
+ * Q2：last 为什么要分两种取值？
+ * A ：idleproc 是复用启动现场造的 0 号空闲线程，没有挂进 proc_list，它的 list_link
+ *     是孤立节点；从它往后找会走野指针。普通线程从自己节点的下一个开始，才是公平轮转。
+ * Q3：循环结束后为什么还要判 state？
+ * A ：do-while 正常走完一圈时，next 是“最后一个看过、但不可运行”的线程，不是 NULL；
+ *     只判 NULL 会把一个在睡的线程切上 CPU。所以两种都要兜回 idleproc。
+ * Q4：不用 do-while 用 while 行不行？
+ * A ：行不通。链表里可能只有当前线程自己，while 可能一次都不进循环，next 永远是 NULL。
+ *     do-while 保证“至少检查一次”。*/
+
 /* schedule - 选一个可运行的线程并把 CPU 交给它
  *
  * 分三步：

@@ -16,6 +16,23 @@
 # 存进了 proc_run 的栈帧，所以这里只需负责 callee-saved 那一半，
 # 再加上“回到哪”（ra）和“用哪个栈”（sp），正好 14 个。
 # 多存不会错，只是多余；少存一个，该线程被换回时就会拿到别人的寄存器值，表现为“偶发跑飞”。
+#
+# ---- 答辩问答（对应本函数） ----
+# Q1：到底是哪 14 个？为什么不是 32 个？
+# A ：ra、sp、s0~s11。t0~t6 / a0~a7 / ra 属 caller-saved，编译器在调用 switch_to 之前
+#     已经把“后面还要用”的那些压进了 proc_run 的栈帧；switch_to 只需负责 callee-saved
+#     的 s0~s11，加上“回到哪”(ra) 和“用哪个栈”(sp)。全存 32 个不会错，只是白干。
+# Q2：lab3 的 RESTORE_ALL 要求 sp 最后恢复，这里为什么没这个要求？
+# A ：那边所有 LOAD 都以 sp 为基址，先改 sp 后面就全读错位置；这里所有存取都以
+#     a0/a1（普通指针）为基址，sp 只是被存取的数据之一，把 LOAD sp 提到第一条也正确。
+# Q3：ret 执行完去哪？（分两种情况）
+# A ：老线程——context.ra 是上次 jal 存的返回地址，回到它自己 proc_run 里 switch_to
+#     的下一行（local_intr_restore），再返回 schedule、cpu_idle；
+#     新线程——context.ra 是 copy_thread 设的 forkret，于是
+#     forkret → forkrets → __trapret → sret → kernel_thread_entry → 线程函数。
+# Q4：漏存 s6 会怎样？为什么难查？
+# A ：该线程恢复时 s6 是别的线程的值，用它存的指针/循环变量就变成垃圾；
+#     现象取决于“被谁切走、切到哪”，时对时错，所以极难复现和定位。
 # ============================================================
 # void switch_to(struct context *from, struct context *to)
 #   a0 = from：当前（被换下）线程的 context 地址
