@@ -37,8 +37,14 @@ idleproc 永远可运行，用它保证“CPU 永远有活干”。*/
  * A ：do-while 正常走完一圈时，next 是“最后一个看过、但不可运行”的线程，不是 NULL；
  *     只判 NULL 会把一个在睡的线程切上 CPU。所以两种都要兜回 idleproc。
  * Q4：不用 do-while 用 while 行不行？
- * A ：行不通。链表里可能只有当前线程自己，while 可能一次都不进循环，next 永远是 NULL。
- *     do-while 保证“至少检查一次”。*/
+ * A ：不行。le 一开始就等于 last，`while (le != last)` 第一次判断就为假，一次都不进，
+ *     next 永远是 NULL。do-while 保证“至少检查一次”。
+ * Q5：next 什么时候会是 NULL？
+ * A ：只有一种情况——current 是 idleproc 且 proc_list 为空（除表头外没有线程）。
+ *     因为那时 last = &proc_list，走一步就回到表头、被 `!= &proc_list` 跳过，
+ *     body 一次都没执行。普通线程当 current 时，转一圈最后会检查到它自己，
+ *     next 至少被赋值一次，不会是 NULL。lab4 里 proc_list 至少有 initproc，
+ *     所以这只是防御性判断（防止将来所有线程退出、链表变空时崩）。*/
 
 /* schedule - 选一个可运行的线程并把 CPU 交给它
  *
@@ -81,10 +87,13 @@ schedule(void) {
          *   第 3 轮：le = next(H) = P1，不是表头 → next = P1，能跑 → break
          *   结果 next = P1。
          *
-         * 注意两点：
-         *   1) 它不检查 current 自己（起点是它的下一个），这是“轮转”的语义；
-         *   2) 若一圈都没找到，next 会停在“最后看过但不可用”的那个（或仍是 NULL），
-         *      交给下面的兜底处理。 */
+         * 注意三点：
+         *   1) current 自己也会被检查，但排在**最后一个**——因为循环条件是“body 执行完
+         *      才判断”，所以 le 走回锚点的那一步，body 已经看过它了。若它是 RUNNABLE，
+         *      就 next = current，后面 next != current 为假，等于原地不动；
+         *   2) 若一圈都没找到能跑的，next 会停在“最后看过但不可用”的那个（通常就是
+         *      current 自己），交给下面的兜底处理；
+         *   3) 只有“current 是 idleproc 且链表为空”时，body 一次都没进，next 才会仍是 NULL。 */
         le = last;                       /* 游标放到锚点，do-while 会从它的下一个开始 */
         do {
             if ((le = list_next(le)) != &proc_list) {  /* 先走一步；表头是哨兵，跳过 */
