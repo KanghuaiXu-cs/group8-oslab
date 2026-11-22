@@ -61,15 +61,17 @@ bootstacktop:
     .global boot_page_table_sv39
 # 分配 4KiB 内存给预设的三级页表
 boot_page_table_sv39:
-    # PTE[2]: 恒等映射 VA 0x80000000 -> PA 0x80000000
-    # 开启 Sv39 的瞬间 PC 仍为物理地址 0x802000xx，
-    # QEMU >= 9 在 csrw satp 处结束翻译块，后续取址需要该映射才不缺页
-    .zero 8 * 2
-    .quad (0x80000 << 10) | 0xcf # VRWXAD
     # 0xffffffff_c0000000 map to 0x80000000 (1G)
-    # 其余页表项均设置为 0 ，因此 V=0 ，意味着是空的(unmapped)
-    .zero 8 * (511 - 3)
-    # 设置最后一个页表项，PPN=0x80000，标志位 VRWXAD 均为 1
+    # 项 0、1 留空
+    .zero 8 * 2
+    # 项 2：0x80000000 -> 0x80000000（1G 恒等映射）
+    # satp 写入的瞬间 PC 还在物理地址段 0x8020xxxx，
+    # 若这一段未映射，取指立刻缺页，跳到 stvec(=0) 再缺页，形成无输出的死循环。
+    .quad (0x80000 << 10) | 0xcf # VRWXAD
+    # 项 3..510 留空
+    .zero 8 * 508
+    # 项 511：0xffffffff_c0000000 -> 0x80000000
+    # PPN=0x80000，标志位 VRWXAD 均为 1
     .quad (0x80000 << 10) | 0xcf # VRWXAD
 
     .global boot_hartid

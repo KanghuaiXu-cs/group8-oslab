@@ -1,96 +1,58 @@
-/* =============================================================================
- * pmm.c —— 物理内存管理（PMM）框架层（lab2 实现，lab3 沿用）
- *
- * 【本文件的角色】它不实现具体分配算法，而是"框架 + 分发器"：
- *   - 真正的算法在 kern/mm/best_fit_pmm.c（best_fit 最佳适配），通过
- *     pmm_manager 函数指针表挂接进来（见 init_pmm_manager）；
- *   - 本文件负责三件事：
- *     1) page_init     ：探测物理内存、划掉保留区、把空闲页注册给管理器
- *     2) alloc/free 等 ：关中断临界区 + 转发给 pmm_manager
- *     3) pmm_init      ：启动时按顺序把以上流程拉起来
- *
- * 【物理页怎么被"管理"】用一个 struct Page 描述一个 4KB 物理页，所有描述符
- *   排成数组 pages[]，下标 = 物理地址对应页号 - nbase。从此"管理物理内存"
- *   变成"管理这个数组"，算法只需操作数组元素（见 memlayout.h/pmm.h）。
- * ========================================================================== */
-
 #include <default_pmm.h>
 #include <best_fit_pmm.h>
 #include <defs.h>
 #include <error.h>
+#include <kmalloc.h>
 #include <memlayout.h>
 #include <mmu.h>
 #include <pmm.h>
 #include <sbi.h>
 #include <stdio.h>
 #include <string.h>
-#include <../sync/sync.h>
+#include <sync.h>
+#include <vmm.h>
 #include <riscv.h>
 #include <dtb.h>
 
-// ---------------------------------------------------------------------------
-// 全局状态（其他文件经 pmm.h 的 extern 声明引用）
-// ---------------------------------------------------------------------------
-
-// pages ：物理页描述符数组的虚拟地址。数组第 i 项描述物理页号 (nbase+i)。
-//         这是 pmm 的核心数据结构入口——分配/释放算法操作的就是数组元素。
+// virtual address of physical page array
 struct Page *pages;
-// npage ：物理内存末尾的绝对页号（exclusive，不是"页数"）。
-//         可管理的页数 = npage - nbase；npage 在 page_init 里由 DTB 信息算出。
+// amount of physical memory (in pages)
 size_t npage = 0;
-// va_pa_offset ：内核虚拟地址与物理地址的固定偏移 = 0xFFFFFFFF40000000。
-//         内核被链接在 VA=0xFFFFFFFFC0000000 处，实际加载在 PA=0x80000000，
-//         任何 VA↔PA 转换（KADDR/PADDR 宏）都依赖它。
-//         含义：内核镜像在 VA=KERNBASE 处运行，对应物理地址 info.base。
-uint64_t va_pa_offset;
-// nbase ：第一个"可管理"物理页的页号。RISC-V 的 DRAM 从 0x80000000 开始
-//         （DRAM_BASE，定义在 riscv.h），之前的地址空间不是 RAM，
-//         所以 nbase = 0x80000000 / 4096 = 0x20000，这之前的页号一律不管。
+// The kernel image is mapped at VA=KERNBASE and PA=info.base
+uint_t va_pa_offset;
+// memory starts at 0x80000000 in RISC-V
 const size_t nbase = DRAM_BASE / PGSIZE;
 
-// satp_virtual / satp_physical ：entry.S 里那张启动页表（boot_page_table_sv39）
-//   的虚拟/物理地址，pmm_init 末尾记录下来，供后续页表相关代码取用。
-uintptr_t *satp_virtual = NULL;
-uintptr_t satp_physical;
+// virtual address of boot-time page directory
+pde_t *boot_pgdir_va = NULL;
+// physical address of boot-time page directory
+uintptr_t boot_pgdir_pa;
 
-// pmm_manager ：当前选用的分配算法（函数指针表，struct 定义见 pmm.h）。
-//   本内核选用 best_fit（最佳适配），在 init_pmm_manager 里赋值。
+// physical memory management
 const struct pmm_manager *pmm_manager;
 
-/* lab3 的 memlayout.h 只保留了 PHYSICAL_MEMORY_OFFSET，删掉了 lab2 里的
- * PHYSICAL_MEMORY_END。这里用 KERNTOP 换算出物理地址上界：
- * 0xFFFFFFFFC8000000 - 0xFFFFFFFF40000000 = 0x88000000。
- * 保持 lab2 的 page_init 逻辑不变，只在本地补一个宏。 */
-#define PHYSICAL_MEMORY_END (KERNTOP - PHYSICAL_MEMORY_OFFSET)
-
-
 static void check_alloc_page(void);
+static void check_pgdir(void);
+static void check_boot_pgdir(void);
 
 // init_pmm_manager - initialize a pmm_manager instance
-static void init_pmm_manager(void) {
+static void init_pmm_manager(void)
+{
     pmm_manager = &best_fit_pmm_manager;
     cprintf("memory management: %s\n", pmm_manager->name);
     pmm_manager->init();
 }
 
 // init_memmap - call pmm->init_memmap to build Page struct for free memory
-static void init_memmap(struct Page *base, size_t n) {
+static void init_memmap(struct Page *base, size_t n)
+{
     pmm_manager->init_memmap(base, n);
 }
 
-// ---------------------------------------------------------------------------
-// 三个对外接口：alloc_pages / free_pages / nr_free_pages
-// 三者是同一套模板 —— 关中断临界区 + 转发给 pmm_manager：
-//   local_intr_save/restore 来自 kern/sync/sync.h，进入前保存 sstatus.SIE
-//   并关中断（flag=1），退出时按 flag 恢复原状（嵌套安全）。
-//   为什么必须关中断：空闲页链表是全局共享数据，"查链表 + 摘链/插链"如果
-//   被时钟中断打断、中断里又触发分配，链表会被并发改坏（丢页/成环）。
-//   lab3 单 hart 无 SMP 竞争，这里的保护对象就是中断嵌套这一种情形。
-// ---------------------------------------------------------------------------
-
-// alloc_pages - 分配 n 个连续物理页，返回首页描述符指针（失败返回 NULL）
-// 实际的适配查找在 best_fit_pmm.c 的 best_fit_alloc_pages 里完成
-struct Page *alloc_pages(size_t n) {
+// alloc_pages - call pmm->alloc_pages to allocate a continuous n*PAGESIZE
+// memory
+struct Page *alloc_pages(size_t n)
+{
     struct Page *page = NULL;
     bool intr_flag;
     local_intr_save(intr_flag);
@@ -101,9 +63,9 @@ struct Page *alloc_pages(size_t n) {
     return page;
 }
 
-// free_pages - 归还从 base 开始的 n 个连续物理页（重新挂回空闲链表）
-// 实现在 best_fit_pmm.c 的 best_fit_free_pages
-void free_pages(struct Page *base, size_t n) {
+// free_pages - call pmm->free_pages to free a continuous n*PAGESIZE memory
+void free_pages(struct Page *base, size_t n)
+{
     bool intr_flag;
     local_intr_save(intr_flag);
     {
@@ -112,8 +74,10 @@ void free_pages(struct Page *base, size_t n) {
     local_intr_restore(intr_flag);
 }
 
-// nr_free_pages - 查询当前空闲页总数（单位：页，乘 PGSIZE 才是字节数）
-size_t nr_free_pages(void) {
+// nr_free_pages - call pmm->nr_free_pages to get the size (nr*PAGESIZE)
+// of current free memory
+size_t nr_free_pages(void)
+{
     size_t ret;
     bool intr_flag;
     local_intr_save(intr_flag);
@@ -125,64 +89,109 @@ size_t nr_free_pages(void) {
 }
 
 //lab2 请补充你在lab2中的代码
-//lab2 function1 2510538
 
-/* page_init - detect physical memory space, reserve already used memory,
- * then use pmm->init_memmap to create free page list.
- * 根据设备树提供的物理内存信息，建立可管理物理页的描述符布局，
- * 把排除 OpenSBI、内核镜像和描述符数组占用后的完整空闲页面注册给当前 pmm_manager。 */
-static void page_init(void) {
+/* page_init - 根据设备树信息建立物理页描述符数组，并把空闲页面交给 pmm 管理器。
+ * 这是 lab2 的代码，lab4 的 pmm_init / kmalloc / alloc_pages 依赖它。 */
+static void page_init(void)
+{
     // 1. 虚实偏移量 = 内核虚拟基址 - DRAM 物理基址
     va_pa_offset = PHYSICAL_MEMORY_OFFSET;
 
-    // 2. 从设备树读物理内存范围（dtb_init 已解析并存入全局变量）
+    // 2. 从设备树读取物理内存范围
     uint64_t mem_begin = get_memory_base();
-    uint64_t mem_size  = get_memory_size();
-    if (mem_begin == 0 || mem_size == 0) {
+    uint64_t mem_size = get_memory_size();
+    if (mem_begin == 0 || mem_size == 0)
+    {
         panic("page_init: DTB memory info not available");
     }
-    uint64_t maxpa = mem_begin + mem_size;   // 物理内存末尾（exclusive）
-    if (maxpa > PHYSICAL_MEMORY_END) {
-        maxpa = PHYSICAL_MEMORY_END;
+
+    uint64_t maxpa = mem_begin + mem_size;
+    uint64_t phys_end = KERNTOP - PHYSICAL_MEMORY_OFFSET;
+    if (maxpa > phys_end)
+    {
+        maxpa = phys_end;
     }
+
     cprintf("physcial memory map:\n");
     cprintf("  memory: 0x%016lx, [0x%016lx, 0x%016lx].\n",
             mem_size, mem_begin, maxpa - 1);
 
-    // 3. npage = 物理内存末尾的绝对页号（exclusive），不是"页数"
+    // 3. npage 是物理内存末尾的绝对页号，不是页数
     npage = maxpa >> PGSHIFT;
 
-    // 4. 描述符数组起点紧接内核结束地址，按页向上对齐
+    // 4. 描述符数组紧接内核结束地址，按页向上对齐
     extern char end[];
     pages = (struct Page *)ROUNDUP((uintptr_t)end, PGSIZE);
 
-    // 5. 先把所有描述符置为保留，防止未完成布局的页面被提前分配
-    for (size_t i = 0; i < npage - nbase; i++) {
+    // 5. 先把所有描述符置为保留，防止未完成布局就被分配
+    for (size_t i = 0; i < npage - nbase; i++)
+    {
         SetPageReserved(pages + i);
     }
 
-    // 6. 空闲内存起点 = 描述符数组末尾转回物理地址后按页向上对齐
+    // 6. 空闲内存起点 = 描述符数组末尾转回物理地址后按页对齐
     uintptr_t freemem = PADDR((uintptr_t)pages + sizeof(struct Page) * (npage - nbase));
     freemem = ROUNDUP(freemem, PGSIZE);
 
-    // 7. 空闲终点按页向下对齐；两者之间有完整空闲页面时才注册
+    // 7. 只把完整的空闲页面交给 pmm 管理器
     uint64_t free_end = ROUNDDOWN(maxpa, PGSIZE);
-    if (freemem < free_end) {
+    if (freemem < free_end)
+    {
         init_memmap(pa2page(freemem), (free_end - freemem) >> PGSHIFT);
     }
 }
 
-/* pmm_init - 物理内存管理总入口（init.c 在内核启动最早期调用）
- * 四步固定流程：
- *   1) init_pmm_manager ：选定算法（best_fit）并初始化其空闲链表
- *   2) page_init        ：从 DTB 拿物理内存范围，划掉保留区，注册空闲页
- *   3) check_alloc_page ：跑 best_fit_pmm.c 里的自检函数，验证分配/释放正确
- *   4) 记录启动页表地址 ：satp_virtual/physical，供后续页表代码使用
- * 自检通过的标志就是启动日志里的 "check_alloc_page() succeeded!" */
-void pmm_init(void) {
-    // We need to alloc/free the physical memory (granularity is 4KB or other size).
-    // So a framework of physical memory manager (struct pmm_manager)is defined in pmm.h
-    // First we should init a physical memory manager(pmm) based on the framework.
+static void enable_paging(void)
+{
+    write_csr(satp, 0x8000000000000000 | (boot_pgdir_pa >> RISCV_PGSHIFT));
+}
+
+// boot_map_segment - setup&enable the paging mechanism
+// parameters
+//  la:   linear address of this memory need to map (after x86 segment map)
+//  size: memory size
+//  pa:   physical address of this memory
+//  perm: permission of this memory
+static void boot_map_segment(pde_t *pgdir, uintptr_t la, size_t size,
+                             uintptr_t pa, uint32_t perm)
+{
+    assert(PGOFF(la) == PGOFF(pa));
+    size_t n = ROUNDUP(size + PGOFF(la), PGSIZE) / PGSIZE;
+    la = ROUNDDOWN(la, PGSIZE);
+    pa = ROUNDDOWN(pa, PGSIZE);
+    for (; n > 0; n--, la += PGSIZE, pa += PGSIZE)
+    {
+        pte_t *ptep = get_pte(pgdir, la, 1);
+        assert(ptep != NULL);
+        *ptep = pte_create(pa >> PGSHIFT, PTE_V | perm);
+    }
+}
+
+// boot_alloc_page - allocate one page using pmm->alloc_pages(1)
+// return value: the kernel virtual address of this allocated page
+// note: this function is used to get the memory for PDT(Page Directory
+// Table)&PT(Page Table)
+static void *boot_alloc_page(void)
+{
+    struct Page *p = alloc_page();
+    if (p == NULL)
+    {
+        panic("boot_alloc_page failed.\n");
+    }
+    return page2kva(p);
+}
+
+// pmm_init - setup a pmm to manage physical memory, build PDT&PT to setup
+// paging mechanism
+//         - check the correctness of pmm & paging mechanism, print PDT&PT
+void pmm_init(void)
+{
+    // We need to alloc/free the physical memory (granularity is 4KB or other
+    // size).
+    // So a framework of physical memory manager (struct pmm_manager)is defined
+    // in pmm.h
+    // First we should init a physical memory manager(pmm) based on the
+    // framework.
     // Then pmm can alloc/free the physical memory.
     // Now the first_fit/best_fit/worst_fit/buddy_system pmm are available.
     init_pmm_manager();
@@ -191,16 +200,321 @@ void pmm_init(void) {
     // then use pmm->init_memmap to create free page list
     page_init();
 
-    // use pmm->check to verify the correctness of the alloc/free function in a pmm
+    // use pmm->check to verify the correctness of the alloc/free function in a
+    // pmm
     check_alloc_page();
-
+    // create boot_pgdir, an initial page directory(Page Directory Table, PDT)
     extern char boot_page_table_sv39[];
-    satp_virtual = (pte_t*)boot_page_table_sv39;
-    satp_physical = PADDR(satp_virtual);
-    cprintf("satp virtual address: 0x%016lx\nsatp physical address: 0x%016lx\n", satp_virtual, satp_physical);
+    boot_pgdir_va = (pte_t *)boot_page_table_sv39;
+    boot_pgdir_pa = PADDR(boot_pgdir_va);
+
+    check_pgdir();
+
+    static_assert(KERNBASE % PTSIZE == 0 && KERNTOP % PTSIZE == 0);
+
+    // now the basic virtual memory map(see memalyout.h) is established.
+    // check the correctness of the basic virtual memory map.
+    check_boot_pgdir();
+
+    kmalloc_init();
 }
 
-static void check_alloc_page(void) {
+// get_pte - get pte and return the kernel virtual address of this pte for la
+//        - if the PT contians this pte didn't exist, alloc a page for PT
+// parameter:
+//  pgdir:  the kernel virtual base address of PDT
+//  la:     the linear address need to map
+//  create: a logical value to decide if alloc a page for PT
+// return vaule: the kernel virtual address of this pte
+pte_t *get_pte(pde_t *pgdir, uintptr_t la, bool create)
+{
+    pde_t *pdep1 = &pgdir[PDX1(la)];
+    if (!(*pdep1 & PTE_V))
+    {
+        struct Page *page;
+        if (!create || (page = alloc_page()) == NULL)
+        {
+            return NULL;
+        }
+        set_page_ref(page, 1);
+        uintptr_t pa = page2pa(page);
+        memset(KADDR(pa), 0, PGSIZE);
+        *pdep1 = pte_create(page2ppn(page), PTE_U | PTE_V);
+    }
+    pde_t *pdep0 = &((pte_t *)KADDR(PDE_ADDR(*pdep1)))[PDX0(la)];
+    if (!(*pdep0 & PTE_V))
+    {
+        struct Page *page;
+        if (!create || (page = alloc_page()) == NULL)
+        {
+            return NULL;
+        }
+        set_page_ref(page, 1);
+        uintptr_t pa = page2pa(page);
+        memset(KADDR(pa), 0, PGSIZE);
+        *pdep0 = pte_create(page2ppn(page), PTE_U | PTE_V);
+    }
+    return &((pte_t *)KADDR(PDE_ADDR(*pdep0)))[PTX(la)];
+}
+
+// get_page - get related Page struct for linear address la using PDT pgdir
+struct Page *get_page(pde_t *pgdir, uintptr_t la, pte_t **ptep_store)
+{
+    pte_t *ptep = get_pte(pgdir, la, 0);
+    if (ptep_store != NULL)
+    {
+        *ptep_store = ptep;
+    }
+    if (ptep != NULL && *ptep & PTE_V)
+    {
+        return pte2page(*ptep);
+    }
+    return NULL;
+}
+
+// page_remove_pte - drop one valid PTE: decrement the page reference,
+// free the page when it reaches zero, clear the entry and flush the TLB.
+static inline void
+page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep)
+{
+    if (*ptep & PTE_V)
+    {
+        struct Page *page = pte2page(*ptep);
+        if (page_ref_dec(page) == 0)
+        {
+            free_page(page);
+        }
+        *ptep = 0;
+        tlb_invalidate(pgdir, la);
+    }
+}
+
+// page_insert - map la to the physical page with permission perm.
+// Return 0 on success, -E_NO_MEM when get_pte fails to allocate an
+// intermediate page table page (no leaf PTE is written in that case).
+int
+page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm)
+{
+    pte_t *ptep = get_pte(pgdir, la, 1);
+    if (ptep == NULL)
+    {
+        return -E_NO_MEM;
+    }
+
+    // Take the new reference first, so re-mapping the same page cannot
+    // accidentally free it while the old entry is being removed.
+    page_ref_inc(page);
+    if (*ptep & PTE_V)
+    {
+        struct Page *old = pte2page(*ptep);
+        if (old == page)
+        {
+            // Same page: cancel the increment, keep the page alive.
+            page_ref_dec(page);
+        }
+        else
+        {
+            // Different page: release the old mapping completely.
+            page_remove_pte(pgdir, la, ptep);
+        }
+    }
+
+    // Overwrite the whole entry so stale permission bits are gone.
+    // pte_create() supplies PTE_V by itself.
+    *ptep = pte_create(page2ppn(page), perm);
+    tlb_invalidate(pgdir, la);
+    return 0;
+}
+
+// page_remove - idempotent unmap: silently return when la is not mapped.
+void
+page_remove(pde_t *pgdir, uintptr_t la)
+{
+    // create = 0: removing a mapping must never allocate page table pages.
+    pte_t *ptep = get_pte(pgdir, la, 0);
+    if (ptep != NULL)
+    {
+        page_remove_pte(pgdir, la, ptep);
+    }
+}
+
+
+
+
+
+
+
+// invalidate a TLB entry, but only if the page tables being
+// edited are the ones currently in use by the processor.
+void tlb_invalidate(pde_t *pgdir, uintptr_t la)
+{
+    // flush_tlb();
+    // The flush_tlb flush the entire TLB, is there any better way?
+    asm volatile("sfence.vma %0" : : "r"(la));
+}
+
+static void check_alloc_page(void)
+{
     pmm_manager->check();
     cprintf("check_alloc_page() succeeded!\n");
+}
+
+static void check_pgdir(void)
+{
+    // assert(npage <= KMEMSIZE / PGSIZE);
+    // The memory starts at 2GB in RISC-V
+    // so npage is always larger than KMEMSIZE / PGSIZE
+    size_t nr_free_store;
+
+    nr_free_store = nr_free_pages();
+
+    assert(npage <= KERNTOP / PGSIZE);
+    assert(boot_pgdir_va != NULL && (uint32_t)PGOFF(boot_pgdir_va) == 0);
+    assert(get_page(boot_pgdir_va, 0x0, NULL) == NULL);
+
+    struct Page *p1, *p2;
+    p1 = alloc_page();
+    assert(page_insert(boot_pgdir_va, p1, 0x0, 0) == 0);
+
+    pte_t *ptep;
+    assert((ptep = get_pte(boot_pgdir_va, 0x0, 0)) != NULL);
+    assert(pte2page(*ptep) == p1);
+    assert(page_ref(p1) == 1);
+
+    ptep = (pte_t *)KADDR(PDE_ADDR(boot_pgdir_va[0]));
+    ptep = (pte_t *)KADDR(PDE_ADDR(ptep[0])) + 1;
+    assert(get_pte(boot_pgdir_va, PGSIZE, 0) == ptep);
+
+    p2 = alloc_page();
+    assert(page_insert(boot_pgdir_va, p2, PGSIZE, PTE_U | PTE_W) == 0);
+    assert((ptep = get_pte(boot_pgdir_va, PGSIZE, 0)) != NULL);
+    assert(*ptep & PTE_U);
+    assert(*ptep & PTE_W);
+    assert(boot_pgdir_va[0] & PTE_U);
+    assert(page_ref(p2) == 1);
+
+    assert(page_insert(boot_pgdir_va, p1, PGSIZE, 0) == 0);
+    assert(page_ref(p1) == 2);
+    assert(page_ref(p2) == 0);
+    assert((ptep = get_pte(boot_pgdir_va, PGSIZE, 0)) != NULL);
+    assert(pte2page(*ptep) == p1);
+    assert((*ptep & PTE_U) == 0);
+
+    page_remove(boot_pgdir_va, 0x0);
+    assert(page_ref(p1) == 1);
+    assert(page_ref(p2) == 0);
+
+    page_remove(boot_pgdir_va, PGSIZE);
+    assert(page_ref(p1) == 0);
+    assert(page_ref(p2) == 0);
+
+    assert(page_ref(pde2page(boot_pgdir_va[0])) == 1);
+
+    pde_t *pd1 = boot_pgdir_va, *pd0 = page2kva(pde2page(boot_pgdir_va[0]));
+    free_page(pde2page(pd0[0]));
+    free_page(pde2page(pd1[0]));
+    boot_pgdir_va[0] = 0;
+    flush_tlb();
+
+    assert(nr_free_store == nr_free_pages());
+
+    cprintf("check_pgdir() succeeded!\n");
+}
+
+static void check_boot_pgdir(void)
+{
+    size_t nr_free_store;
+    pte_t *ptep;
+    int i;
+
+    nr_free_store = nr_free_pages();
+
+    for (i = ROUNDDOWN(KERNBASE, PGSIZE); i < npage * PGSIZE; i += PGSIZE)
+    {
+        assert((ptep = get_pte(boot_pgdir_va, (uintptr_t)KADDR(i), 0)) != NULL);
+        assert(PTE_ADDR(*ptep) == i);
+    }
+
+    assert(boot_pgdir_va[0] == 0);
+
+    struct Page *p;
+    p = alloc_page();
+    assert(page_insert(boot_pgdir_va, p, 0x100, PTE_W | PTE_R) == 0);
+    assert(page_ref(p) == 1);
+    assert(page_insert(boot_pgdir_va, p, 0x100 + PGSIZE, PTE_W | PTE_R) == 0);
+    assert(page_ref(p) == 2);
+
+    const char *str = "ucore: Hello world!!";
+    strcpy((void *)0x100, str);
+    assert(strcmp((void *)0x100, (void *)(0x100 + PGSIZE)) == 0);
+
+    *(char *)(page2kva(p) + 0x100) = '\0';
+    assert(strlen((const char *)0x100) == 0);
+
+    pde_t *pd1 = boot_pgdir_va, *pd0 = page2kva(pde2page(boot_pgdir_va[0]));
+    free_page(p);
+    free_page(pde2page(pd0[0]));
+    free_page(pde2page(pd1[0]));
+    boot_pgdir_va[0] = 0;
+    flush_tlb();
+
+    assert(nr_free_store == nr_free_pages());
+
+    cprintf("check_boot_pgdir() succeeded!\n");
+}
+
+// perm2str - use string 'u,r,w,-' to present the permission
+static const char *perm2str(int perm)
+{
+    static char str[4];
+    str[0] = (perm & PTE_U) ? 'u' : '-';
+    str[1] = 'r';
+    str[2] = (perm & PTE_W) ? 'w' : '-';
+    str[3] = '\0';
+    return str;
+}
+
+// get_pgtable_items - In [left, right] range of PDT or PT, find a continuous
+// linear addr space
+//                  - (left_store*X_SIZE~right_store*X_SIZE) for PDT or PT
+//                  - X_SIZE=PTSIZE=4M, if PDT; X_SIZE=PGSIZE=4K, if PT
+// paramemters:
+//  left:        no use ???
+//  right:       the high side of table's range
+//  start:       the low side of table's range
+//  table:       the beginning addr of table
+//  left_store:  the pointer of the high side of table's next range
+//  right_store: the pointer of the low side of table's next range
+//  return value: 0 - not a invalid item range, perm - a valid item range with
+//  perm permission
+static int get_pgtable_items(size_t left, size_t right, size_t start,
+                             uintptr_t *table, size_t *left_store,
+                             size_t *right_store)
+{
+    if (start >= right)
+    {
+        return 0;
+    }
+    while (start < right && !(table[start] & PTE_V))
+    {
+        start++;
+    }
+    if (start < right)
+    {
+        if (left_store != NULL)
+        {
+            *left_store = start;
+        }
+        int perm = (table[start++] & PTE_USER);
+        while (start < right && (table[start] & PTE_USER) == perm)
+        {
+            start++;
+        }
+        if (right_store != NULL)
+        {
+            *right_store = start;
+        }
+        return perm;
+    }
+    return 0;
 }

@@ -4,9 +4,9 @@
 
 | 项目 | 内容 |
 |------|------|
-| **实验名称** | Lab 3：中断与异常处理 |
+| **实验名称** | Lab 4：进程管理（虚拟内存页操作、进程创建、进程调度） |
 | **小组成员** | 2510789-徐康怀、2514022-邓翔予、2510538-张铭瑞 |
-| **完成日期** | 2026-11-07 |
+| **完成日期** | 2026-11-20 |
 
 ### 小组分工
 
@@ -14,19 +14,19 @@
 
 | 成员 | 负责的练习/模块 |
 |------|----------------|
-| 2510789-徐康怀 | 功能模块一：Trap 上下文恢复与入口（`RESTORE_ALL`、`__alltraps`） |
-| 2514022-邓翔予 | 功能模块二：中断处理（`interrupt_handler`，时钟中断） |
-| 2510538-张铭瑞 | 功能模块二：异常处理（`exception_handler`、`insn_len`） |
+| 2514022-邓翔予 | 功能模块一：虚拟内存页操作（`page_insert`、`page_remove`） |
+| 2510538-张铭瑞 | 功能模块二：进程创建及初始化（`alloc_proc`、`proc_init`、`kernel_thread`、`do_fork`、`copy_thread`、`copy_mm`）+ Challenge |
+| 2510789-徐康怀 | 功能模块三：进程调度（`cpu_idle`、`schedule`、`proc_run`、`switch_to`） |
 
 实验报告分工：
 
 | 成员 | 负责章节 |
 |------|----------|
-| 2510789-徐康怀 | 4.1 功能模块一；5.2 上下文/断点测试 |
-| 2514022-邓翔予 | 4.2.1 中断处理；5.4 持续时钟测试 |
-| 2510538-张铭瑞 | 三、整体逻辑；4.2.2 异常处理；4.3 提示词与迭代；5.1/5.3/5.5～5.7；六、总结 |
+| 2514022-邓翔予 | 4.1 功能模块一；5.1 页表相关测试 |
+| 2510538-张铭瑞 | 三、整体逻辑；4.2 功能模块二；4.4 Challenge；5.2 进程创建测试；六、总结 |
+| 2510789-徐康怀 | 4.3 功能模块三；5.3 调度测试；二、实验环境 |
 
-> 说明：4.1、4.2.1 的“最终提示词/实现迭代过程”由对应负责人补充，本文暂记录接口、当前集成行为和测试结果。
+> 说明：4.1、4.2、4.4 的“最终提示词 / 实现迭代过程”由对应负责人补充，本文先记录各模块的接口、集成行为与测试结果；模块三（4.3）由徐康怀完整撰写。
 
 ---
 
@@ -34,11 +34,11 @@
 
 本实验的主要目的是：
 
-1. 理解 RISC-V 的 Trap 机制：中断（interrupt）与异常（exception）的区别，`scause`、`sepc`、`stvec`、`sstatus` 等 CSR 在 Trap 中的作用。
-2. 理解 Trap 上下文的保存与恢复：`struct trapframe` 的布局、`SAVE_ALL`/`RESTORE_ALL` 的对应关系，以及为什么 `sp` 要特殊处理。
-3. 理解 Trap 入口与返回的完整闭环：`__alltraps` → `trap()` → `trap_dispatch()` → `exception_handler()`/`interrupt_handler()` → `__trapret` → `sret`。
-4. 掌握同步异常的处理方法：非法指令和断点异常发生后，如何根据指令长度修正 `epc`，使 `sret` 返回后不会重复执行同一条指令。
-5. 掌握时钟中断的基本处理：重设下一次时钟事件、累计 `ticks`、按 `TICK_NUM` 输出统计信息、累计到 `SHUTDOWN_AFTER` 后关机。
+1. 理解**多级页表的映射维护**：`page_insert` / `page_remove` 如何建立与撤销“线性地址 → 物理页”的映射，以及页表项内容、物理页引用计数、TLB 三者为什么必须保持一致。
+2. 理解**进程（线程）控制块与地址空间**：`struct proc_struct` 里每个字段的含义，内核栈、trapframe、`struct context` 三者在“线程被创建”和“线程第一次运行”时分别承担什么角色。
+3. 理解**调度机制与调度策略的分离**：`schedule()` 负责“选谁”，`proc_run()` 负责“切过去”，`switch_to()` 只负责“保存/恢复寄存器现场”。
+4. 理解**上下文切换的调用约定依据**：为什么 `switch_to` 只需要保存 `ra`、`sp`、`s0`~`s11`，而不是像 lab3 的 `RESTORE_ALL` 那样保存全部 32 个通用寄存器。
+5. 理解**新线程的首次运行链路**：`forkret → forkrets → __trapret → sret → kernel_thread_entry` 是如何把“一个函数”变成“一个线程”的。
 6. 练习“先写 Spec、再写 Prompt、让 AI 生成、自己验证”的协作方式。
 
 ---
@@ -48,21 +48,23 @@
 | 组件 | 版本/说明 |
 |---|---|
 | 宿主系统 | Windows 11 + WSL2 |
-| Linux 发行版 | Ubuntu 24.04 |
-| 交叉编译器 | `riscv64-unknown-elf-gcc 13.2.0` |
-| 模拟器 | 张铭瑞：QEMU 8.2.2；徐康怀：QEMU 4.1.1（现场演示） |
-| 固件 | OpenSBI v1.3（`-bios default`） |
-| 构建方式 | `make` / `make qemu` |
+| Linux 发行版 | Ubuntu（WSL2） |
+| 交叉编译器 | `riscv64-unknown-elf-gcc 13.2.0`；本地验证用 xpack `riscv-none-elf-gcc 13.3.0`（需显式 `-march=rv64gc_zicsr -mabi=lp64d`） |
+| 模拟器 | 演示/验收：QEMU 4.1.1；本地开发验证：QEMU 10.2 |
+| 固件 | OpenSBI（`-bios default`；4.1.1 对应 v1.3，10.2 对应 v1.8） |
+| 构建方式 | `make` / `make qemu` / `make grade` |
 
 AI 工具：
 
 | 成员 | AI 编程工具 | 底层模型 | 备注 |
 |------|------------|---------|------|
-| 2510789-徐康怀 | 待组员补充 | 待组员补充 | — |
 | 2514022-邓翔予 | 待组员补充 | 待组员补充 | — |
-| 2510538-张铭瑞 | DeepSeek Harness | deepseek-flash | 用于异常处理代码、测试与报告整理 |
+| 2510538-张铭瑞 | 待组员补充 | 待组员补充 | — |
+| 2510789-徐康怀 | DeepSeek Harness（VS Code 集成） | deepseek-flash | 用于调度代码生成、审查与本地验证脚本 |
 
-> QEMU 版本差异：本机 8.2.2 的 `make grade` 使用 `-device loader` 时，OpenSBI 的 `next_addr` 为 0，CPU 会从 0 取指；改用 `-kernel` 启动同一套注入测试则全部通过。现场演示以徐康怀的 QEMU 4.1.1 为准。
+> **QEMU 版本差异（重要）**：课程要求 QEMU 4.1.1，本地只有 10.2，验证时遇到两处版本差异：
+> 1. QEMU ≥ 9 下 `-device loader` 会让 OpenSBI 的 `next_addr` 变成 0，内核不启动；本地改用 `-kernel bin/ucore.img`。`Makefile` / `tools/grade.sh` 保持原样，未做任何修改。
+> 2. QEMU 10 会检查“非叶子页表项的保留位”，而框架的 `get_pte()` 给中间级页表项写了 `PTE_U`，导致新映射一访问就 page fault（现象是 `check_pgdir()` 之后内核“重启”）。这是**框架代码 + QEMU 版本**的差异，4.1.1 上不存在；本地验证只在临时副本里打补丁，交付代码保持原样。
 
 ---
 
@@ -70,51 +72,122 @@ AI 工具：
 
 ### 3.1 本章节的逻辑主线
 
-Lab1 让内核能启动，Lab2 让内核能管理物理内存，但这两章的内核都只能沿着一条直线往下跑：它不会响应外部设备，也无法在指令出错时接管现场。
+Lab2 让内核能管物理内存，Lab3 让内核能被打断并回到原处。但这两章的内核仍然是“一个执行流”：它能被人打断，却**没有“多个执行流”的概念**。
 
-Lab3 要补的是：
+Lab4 要补的是：
 
-> **当 CPU 被某个事件打断时，操作系统如何保存现场、判断原因、处理事件，再恢复现场回到原处继续执行。**
+> **把“一块内存 + 一段代码”包装成可以被保存、被恢复、被排队、被切换的执行实体（线程），并让 CPU 在多个线程之间流转。**
 
-RISC-V 把中断和异常统称为 Trap。Trap 发生时，硬件只做最少的事：
+整章的三条主线正好对应三个模块：
 
-- 记录原因码到 `scause`；
-- 记录出错/被打断的地址到 `sepc`；
-- 把当前特权级和中断使能状态保存到 `sstatus`；
-- 跳到 `stvec` 指向的入口。
+| 主线 | 模块 | 解决的问题 |
+|---|---|---|
+| 虚拟内存页操作 | 一 | 一个线性地址最终对应哪一页物理内存，怎么建立/撤销 |
+| 进程创建与初始化 | 二 | 线程对象从哪来：PCB、内核栈、trapframe、首次运行现场 |
+| 进程调度 | 三 | 线程对象怎么真正跑起来：选谁、切页表、切寄存器现场 |
 
-剩下的“保存哪些寄存器、怎么分类、怎么处理、怎么返回”全部由软件完成。
-
-所以整章可以概括成三句话：
-
-1. **先定义现场**：`struct trapframe` 是 36 个 8 字节字段，汇编和 C 必须共用同一套布局。
-2. **再打通进出通道**：`__alltraps` 保存现场并调用 `trap()`，`__trapret` 恢复现场并 `sret`。
-3. **最后在通道中间挂处理逻辑**：`trap_dispatch()` 根据 `cause` 最高位分流到中断或异常处理。
+三者的依赖顺序是**由下往上**的：页表操作是地址空间的地基；进程创建需要页表和内核栈；“能不能切过去”又要求先“有可切的对象”。所以模块三只能放在最后——它不是“创建资源”，而是“让已有资源动起来”。
 
 ### 3.2 功能的逐步实现
 
-1. **先实现上下文恢复（`RESTORE_ALL`）**  
-   为什么先做这个？因为 `SAVE_ALL` 已经把现场压栈，但如果恢复顺序错了，C 处理函数返回后回不到原程序；`sp` 必须最后恢复，否则前面所有 `LOAD` 都会读错位置。
+整个 lab4 的启动链是：
 
-2. **再实现 Trap 入口（`__alltraps`）**  
-   为什么接着做？`SAVE_ALL` 之后要把 `sp` 作为 `trapframe *` 传给 `trap()`；处理完再进入 `__trapret`。入口和返回是一对，必须一起打通。
+```
+kern_init
+  → pmm_init      （物理内存 + 页表 + kmalloc）
+  → pic_init / idt_init
+  → vmm_init      （mm / vma 结构与检查）
+  → proc_init     （idleproc + initproc）
+  → clock_init / intr_enable
+  → cpu_idle      （模块三入口）
+      → schedule        （选谁）
+          → proc_run    （切 current、切页表）
+              → switch_to （切寄存器现场）
+```
 
-3. **然后实现异常处理（`exception_handler`）**  
-   为什么接着做？入口/返回通了之后，同步异常才有意义。非法指令和断点是最好构造、最容易验证的两类异常：执行一条 `ebreak` 或一个非法编码就能触发。
+四个“为什么按这个顺序”：
 
-4. **再实现中断处理（`interrupt_handler`）**  
-   为什么接着做？时钟中断是异步事件，能验证“处理完还能回到原程序继续跑”，也能验证 `epc` 不需要像异常那样推进。
+1. **先做页表操作（模块一）**：`page_insert`/`page_remove` 是“线性地址 ↔ 物理页”的唯一入口。没有它，`check_boot_pgdir()`、`kmalloc` 都无法通过；而后面线程的内核栈、trapframe 全都要落在这套映射上。
+2. **再做进程创建（模块二）**：`alloc_proc` 给出干净的 PCB，`proc_init` 复用当前启动现场造出 `idleproc`、再用 `kernel_thread` 造出 `initproc`。`copy_thread` 把 trapframe 放到新线程自己的内核栈顶，并把 `context.ra` 设成 `forkret`——这一步是**为模块三准备“路标”**。
+3. **然后做调度（模块三）**：有了 `idleproc` 和 `initproc`，`cpu_idle → schedule → proc_run → switch_to` 才能把它们真正放到 CPU 上跑。模块三不创建任何资源，只负责“选”和“切”。
+4. **最后用测试验收**：`[Test PMM]` 验证映射；`[Test Process Create]` 验证 `idleproc/initproc` 的字段；`[Test Schedule]` 额外创建两个线程并反复切换，验证“切换后还能切回来、两个线程都真正执行过”。
 
-5. **最后用测试验收**  
-   上下文测试验证入口/恢复；非法指令测试验证 `+4` 和兜底；时钟测试验证持续返回；`c.ebreak` 补验 `+2`。
-
-一句话：**先把现场定义清楚，再把进出通道打通，最后才在通道中间挂分类处理逻辑。**
+一句话：**先把地址空间修好，再把线程对象造出来，最后让 CPU 在它们之间流转。**
 
 ---
 
 ## 四、实验内容与实现
 
-### 4.1 功能模块一：Trap 上下文恢复与入口
+### 4.1 功能模块一：虚拟内存页操作
+
+**负责人：** 2514022-邓翔予
+
+#### 模块功能描述
+
+**需要实现/修改的函数：**
+
+```c
+int  page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm);
+void page_remove(pde_t *pgdir, uintptr_t la);
+```
+
+**功能说明：**
+
+在现有多级页表框架上完成最基本的映射维护：把物理页挂到指定线性地址上，以及把已有映射安全地撤销掉。两者共同决定“一个线性地址最终对应哪一页物理内存”，并负责让**页表项内容、物理页引用计数、TLB 状态**三者保持一致。对外表现为“建立映射”和“撤销映射”两个动作，是后续线程地址空间逻辑的基础。
+
+#### 最终提示词
+
+> 由负责人补充。
+
+#### 实现迭代过程
+
+> 由负责人补充。
+
+---
+
+### 4.2 功能模块二：进程创建及初始化
+
+**负责人：** 2510538-张铭瑞
+
+#### 模块功能描述
+
+**需要实现/修改的函数：**
+
+```c
+static struct proc_struct *alloc_proc(void);
+void proc_init(void);
+int  kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags);
+int  do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf);
+static void copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf);
+static int  copy_mm(uint32_t clone_flags, struct proc_struct *proc);
+```
+
+**功能说明：**
+
+把系统从“能跑内核代码”推进到“能创建并登记多个内核线程”：`alloc_proc` 拿到干净的 PCB；`proc_init` 把当前执行现场包装成 `idleproc` 并创建第一个真正的内核线程 `initproc`；`kernel_thread` 把函数入口和参数整理成线程首次运行所需的临时 trapframe；`do_fork` 把 PCB、内核栈、PID、链表、状态位组合成可运行实体；`copy_thread` 把 trapframe 和 `context` 安放到新线程自己的内核栈上；`copy_mm` 在当前阶段是地址空间处理的占位接口。
+
+其中与模块三直接相关的“路标”由 `copy_thread` 设置：
+
+```c
+proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE - sizeof(struct trapframe));
+*(proc->tf) = *tf;                    // 复制 kernel_thread() 构造的临时现场
+proc->tf->gpr.a0 = 0;                 // 子线程从“fork 返回 0”
+proc->tf->gpr.sp = (uintptr_t)proc->tf;
+proc->context.ra = (uintptr_t)forkret; // 第一次被调度时从这里开始
+proc->context.sp = (uintptr_t)(proc->tf);
+```
+
+#### 最终提示词
+
+> 由负责人补充。
+
+#### 实现迭代过程
+
+> 由负责人补充。
+
+---
+
+### 4.3 功能模块三：进程调度
 
 **负责人：** 2510789-徐康怀
 
@@ -123,508 +196,275 @@ RISC-V 把中断和异常统称为 Trap。Trap 发生时，硬件只做最少的
 **需要实现/修改的函数：**
 
 ```c
-// kern/trap/trapentry.S
-RESTORE_ALL;      // 汇编宏
-__alltraps;       // Trap 入口
-__trapret;        // Trap 返回
+// kern/process/proc.c
+void cpu_idle(void);
+void proc_run(struct proc_struct *proc);
+
+// kern/schedule/sched.c
+void schedule(void);
+
+// kern/process/switch.S
+void switch_to(struct context *from, struct context *to);
 ```
 
 **功能说明：**
 
-- `__alltraps` 是 `stvec` 指向的入口：先 `SAVE_ALL`，把 32 个通用寄存器和 4 个 CSR 压成 `trapframe`，再把 `sp` 作为参数调用 `trap()`。
-- `__trapret` 在 `trap()` 返回后执行 `RESTORE_ALL`，最后 `sret`。
-- `RESTORE_ALL` 的顺序：先恢复 `sstatus`/`sepc`，再恢复通用寄存器，最后恢复 `sp`。
-- `sp` 特殊：`SAVE_ALL` 通过 `sscratch` 保存进入 Trap 前的旧 `sp`，所以 `RESTORE_ALL` 要从 trapframe 的偏移 `2 * REGBYTES` 取它，不能提前恢复。
+把已经创建出来的内核线程真正交给 CPU 执行。四个函数职责严格分层：
+
+| 函数 | 职责 | 不做什么 |
+|---|---|---|
+| `cpu_idle` | 空闲线程主体，检测到 `need_resched` 就进调度器 | 不决定选谁 |
+| `schedule` | 从 `proc_list` 里选出下一个 `PROC_RUNNABLE`，找不到回退 `idleproc` | 不碰硬件寄存器现场 |
+| `proc_run` | 更新 `current`、切 `satp` 并刷 TLB、调用 `switch_to` | 不做策略判断 |
+| `switch_to` | 只保存/恢复 `ra`、`sp`、`s0`~`s11` | 不做任何调度决策 |
+
+这四层的关系其实就是**机制与策略分离**：`schedule` 是策略，`proc_run`/`switch_to` 是机制。
 
 #### 最终提示词
 
-> 由徐康怀补充。
+````markdown
+[PROMPT]
+在 riscv64-ucore 的 lab4 中实现“功能模块三：进程调度”，只改三处标记：
+1. kern/process/proc.c 的 //LAB4 function3 2510789：cpu_idle()、proc_run()
+2. kern/schedule/sched.c 的 //LAB4 function3 2510789：schedule()
+3. kern/process/switch.S 的 //LAB4 function3 2510789：switch_to()
+要求给出完整代码、逐段解释（解释“为什么”而不只是“做什么”），以及可执行的验证方法。
+不要修改这三个文件里的其他函数，不要改 Makefile 和 tools/。
+
+[RELY]
+- struct context 定义在 kern/process/proc.h，字段顺序：
+  ra, sp, s0, s1, ..., s11（共 14 个 uintptr_t，偏移 0..13*8）
+- struct proc_struct 关键字段：
+  state（PROC_UNINIT/PROC_SLEEPING/PROC_RUNNABLE/PROC_ZOMBIE）、
+  kstack、need_resched、context、tf、pgdir（页目录物理地址）、list_link
+- 全局量：proc_list（链表头）、idleproc、initproc、current
+- 机制：
+  * idleproc 直接复用启动现场，kstack = bootstack，且**不在 proc_list 里**；
+  * copy_thread 把新线程的 context.ra 设为 forkret、context.sp 设为它的 trapframe，
+    tf->epc = kernel_thread_entry，tf->gpr.s0 = fn，tf->gpr.s1 = arg；
+  * 因此 switch_to 的 ret 会进入 forkret → forkrets → __trapret → sret → kernel_thread_entry；
+  * proc->pgdir 是页目录的**物理地址**，satp 要的是物理页号（要右移 12）。
+- 已有接口：local_intr_save/local_intr_restore（kern/sync/sync.h）、
+  write_csr/read_csr、SATP_MODE_SV39 = 8、RISCV_PGSHIFT = 12（libs/riscv.h）、
+  flush_tlb()（kern/mm/pmm.h，就是 sfence.vma）、le2proc()、list_next()
+- 反面教材：libs/riscv.h 里的 lsatp() 是 Sv32 遗留写法（用 SATP32_MODE），
+  表达不了 Sv39，禁止使用；正确写法参照 kern/mm/pmm.c 的 enable_paging()。
+- 编译选项 -Wall -Werror，不能有警告。
+
+[GUARANTEE]
+- 交付四个函数，签名不可改：
+  void cpu_idle(void); void schedule(void);
+  void proc_run(struct proc_struct *proc); void switch_to(struct context *, struct context *);
+- switch_to 只保存/恢复 ra、sp、s0~s11，最后 ret；
+- schedule 与 proc_run 的“选择 + 切换”必须在关中断的临界区内完成；
+- proc_run 必须写 Sv39 的 satp 并在之后 flush_tlb()；
+- schedule 找不到可运行线程时必须退回 idleproc；
+- cpu_idle 是死循环（proc.h 里声明了 noreturn）；
+- 三处 //LAB4 function3 标记必须保留，并把 YOUR CODE 换成学号。
+
+[SPECIFICATION]
+一、switch_to(from=a0, to=a1)：
+  1. 把当前 ra、sp、s0~s11 存进 from->context 的对应偏移；
+  2. 从 to->context 恢复同样 14 个寄存器；
+  3. ret 跳到恢复出的 ra。
+  边界：存取基址是 a0/a1，不是 sp，所以 sp 不需要“最后恢复”；
+        对新建线程，to->context.ra = forkret，这是它第一次运行的入口。
+
+二、schedule()：
+  1. local_intr_save 关中断；
+  2. current->need_resched = 0；
+  3. 起点 last = (current == idleproc) ? &proc_list : &(current->list_link)；
+  4. 从 last 开始用 list_next 轮转，跳过表头，遇到第一个 state == PROC_RUNNABLE 的 break；
+  5. 转完一圈没找到（或找到的已不可运行）→ next = idleproc；
+  6. next->runs++；若 next != current 则 proc_run(next)；
+  7. local_intr_restore 恢复中断。
+  边界：idleproc 不在 proc_list 里，所以起点必须分情况；
+        一个 RUNNABLE 都没有时要回退 idleproc，不能返回 NULL。
+
+三、proc_run(proc)：
+  1. if (proc == current) 直接返回；
+  2. 关中断；
+  3. current = proc；
+  4. write_csr(satp, ((uintptr_t)SATP_MODE_SV39 << 60) | (proc->pgdir >> RISCV_PGSHIFT))；
+  5. flush_tlb()；
+  6. switch_to(&prev->context, &proc->context)；
+  7. 恢复中断。
+  边界：不能调用 lsatp()（Sv32 写法）；换页表后必须刷 TLB。
+
+四、cpu_idle()：
+  死循环里 if (current->need_resched) schedule();
+
+验收：
+1. make 无 undefined reference；
+2. 注入测试后打印 [Test Schedule] PASS；
+3. initproc 能打印 this initproc, pid = 1, name = "init" 和 To U: "Hello world!!".；
+4. 连续多次运行结果稳定。
+````
+
+**这份提示词的关键点：**
+
+| 段落 | 为什么这么写 |
+|---|---|
+| `[PROMPT]` | 精确到“文件 + 标记 + 函数”，避免 AI 顺手改掉模块二/模块一的代码 |
+| `[RELY]` | 把 `struct context` 的字段顺序、`copy_thread` 设的路标、`pgdir` 是物理地址、`lsatp()` 是 Sv32 陷阱这些**真实事实**喂给 AI，否则它会按“普通过程调用”瞎猜 |
+| `[GUARANTEE]` | 把“只存 14 个寄存器”“必须关中断”“必须 flush_tlb”“必须回退 idleproc”写成硬约束 |
+| `[SPECIFICATION]` | 每个函数写成可执行步骤 + 边界条件，尤其 `schedule` 的起点分情况、`proc_run` 的 satp 拼法 |
 
 #### 实现迭代过程
 
-> 由徐康怀补充。
+本模块的实现经历了 3 次迭代。
 
 ---
 
-### 4.2 功能模块二：中断与异常处理
-
-本模块的入口是框架提供的：
-
-```c
-static inline void trap_dispatch(struct trapframe *tf) {
-    if ((intptr_t)tf->cause < 0) {
-        interrupt_handler(tf);   // 最高位 1：中断
-    } else {
-        exception_handler(tf);   // 最高位 0：异常
-    }
-}
-```
-
-`scause` 最高位是中断标志：1 表示中断，0 表示异常。转成有符号的 `intptr_t` 后，最高位为 1 就是负数，所以可以直接用 `< 0` 判断。
-
-#### 4.2.1 中断处理
-
-**负责人：** 2514022-邓翔予
-
-**需要实现/修改的函数：**
-
-```c
-void interrupt_handler(struct trapframe *tf);
-```
-
-**功能说明：**
-
-- 处理 S 模式时钟中断（`IRQ_S_TIMER = 5`）：
-  - 调用 `clock_set_next_event()` 重设下一次时钟事件；
-  - `ticks++`；
-  - 每 `TICK_NUM = 100` 次打印一次 `100 ticks`；
-  - 累计 `SHUTDOWN_AFTER = 10` 次后调用 `sbi_shutdown()`。
-- 处理软件中断（`IRQ_S_SOFT = 1`）和外部中断（`IRQ_S_EXT = 9`）的提示输出。
-- 其他未知中断打印 cause，并调用 `print_trapframe(tf)` 兜底。
-
-**最终提示词：**
-
-> 由邓翔予补充。
-
-**实现迭代过程：**
-
-> 由邓翔予补充。
-
-#### 4.2.2 异常处理（本人负责，重点）
-
-**负责人：** 2510538-张铭瑞
-
-##### 模块功能描述
-
-**需要实现/修改的函数：**
-
-```c
-static inline size_t insn_len(uintptr_t epc);
-void exception_handler(struct trapframe *tf);
-```
-
-**功能说明：**
-
-`exception_handler()` 由 `trap_dispatch()` 在同步异常时调用，负责：
-
-1. 非法指令异常（cause=2）：打印 `Illegal instruction at 0x...`，并根据指令长度推进 `tf->epc`；
-2. 断点异常（cause=3）：打印 `Breakpoint at 0x...`，同样推进 `tf->epc`；
-3. 其他异常：调用 `print_trapframe(tf)` 打印完整现场，不推进 `tf->epc`。
-
-`insn_len()` 是只在本文件使用的辅助函数：读 `epc` 处 2 字节，低 2 位为 `0b11` 返回 4，否则返回 2。
-
-##### 数据结构
-
-核心数据结构是 `struct trapframe`：
-
-```c
-struct pushregs {
-    uintptr_t zero, ra, sp, gp, tp;
-    uintptr_t t0, t1, t2;
-    uintptr_t s0, s1;
-    uintptr_t a0, a1, a2, a3, a4, a5, a6, a7;
-    uintptr_t s2, s3, s4, s5, s6, s7, s8, s9, s10, s11;
-    uintptr_t t3, t4, t5, t6;
-};
-
-struct trapframe {
-    struct pushregs gpr;   // 32 × 8 = 256 字节
-    uintptr_t status;      // 256
-    uintptr_t epc;         // 264
-    uintptr_t badvaddr;    // 272
-    uintptr_t cause;       // 280
-};                         // 总大小 288 字节
-```
-
-`tf` 是指向栈上 trapframe 的指针，不是拷贝。`exception_handler` 只读 `tf->cause`、读写 `tf->epc`；`print_trapframe` 会读所有字段。
-
-##### Spec 的写法
-
-这次没有直接对 AI 说“实现 `exception_handler`”，而是先把需求拆成四段：
-
-| 段落 | 写法 | 作用 |
-|---|---|---|
-| `[PROMPT]` | 指定文件、函数、调用者、职责 | 防止 AI 改错文件、改错函数 |
-| `[RELY]` | 抄真实定义：`struct trapframe` 字段、`CAUSE_*` 的值、`print_trapframe`、`cprintf`、`sepc/sret`、指令编码规则 | AI 不会自动知道这个工程的布局，不能让它猜 |
-| `[GUARANTEE]` | 写硬约束：签名、非 `static`、只改 `tf->epc`、输出关键字、`-Werror` | 把“必须做到”与“不能做”分开 |
-| `[SPECIFICATION]` | 写行为、失败路径、边界、验收 | 让代码可以被测试，而不是“看起来对” |
-
-最关键的是两条边界：
-
-- **16 位压缩指令**：低 2 位不是 `0b11`，所以不能固定 `+4`；
-- **未知异常**：只打印、不推进 `epc`，不能把没有修复的异常静默跳过。
-
-如果只写“实现异常处理”，AI 很可能生成“打印 + 固定 `+4`”的版本，这正是第一次迭代出现的问题。
-
-##### 最终提示词
-
-以下是实现该模块使用的最终提示词：
-
-````markdown
-[PROMPT]
-在 ucore lab3 的 kern/trap/trap.c 中实现异常处理函数 exception_handler(struct trapframe *tf)。
-它由 trap_dispatch() 在 scause 最高位为 0（同步异常）时调用，负责处理非法指令异常、断点异常，
-并对其他异常做兜底输出。可以增加一个只在本文件使用的 static inline 辅助函数 insn_len()。
-要求给出完整 C 代码、逐段解释，以及可执行的验证方法；不要修改 trap.c 中其他已有函数。
-
-[RELY]
-- struct trapframe 定义在 kern/trap/trap.h：
-  struct pushregs gpr（32 个 uintptr_t）；uintptr_t status; uintptr_t epc;
-  uintptr_t badvaddr; uintptr_t cause;
-- 宏：CAUSE_ILLEGAL_INSTRUCTION = 0x2，CAUSE_BREAKPOINT = 0x3（libs/riscv.h）
-- 函数：void print_trapframe(struct trapframe *tf);（kern/trap/trap.c）
-- 输出：int cprintf(const char *fmt, ...);（libs/stdio.h）
-- 机制：异常发生时硬件把 sepc 设为触发异常的指令地址；__trapret 执行 RESTORE_ALL 后 sret，
-  sret 会跳回 sepc。因此处理函数修改 tf->epc 等价于修改返回地址。
-- RISC-V 指令编码：32 位指令最低 2 位为 0b11；16 位压缩指令最低 2 位不是 0b11。
-- 编译选项：-Wall -Werror，代码不能有警告。
-
-[GUARANTEE]
-- 交付函数：void exception_handler(struct trapframe *tf)，定义在 kern/trap/trap.c；
-- 不要加 static：实验测试代码以 extern 方式引用该符号；
-- 不修改函数签名，不修改 struct trapframe 布局，不修改 trap.c 中其他已有函数；
-- 非法指令和断点异常：输出包含 "Illegal instruction at" / "Breakpoint at" 的信息，
-  并把 tf->epc 推进到下一条指令；
-- 其他异常：只调用 print_trapframe(tf) 兜底，不推进 tf->epc；
-- 辅助函数 insn_len() 用 static inline，只在本文件可见；
-- 代码要能通过 -Werror 编译。
-
-[SPECIFICATION]
-前置条件：
-1. tf 指向 SAVE_ALL 建立的合法 trapframe；
-2. tf->cause 是异常原因码（最高位为 0）；
-3. tf->epc 指向触发异常的指令，且该指令所在页已映射、可读。
-
-行为规格：
-1. cause == 2（非法指令）：
-   - 打印 "Illegal instruction at 0x%016lx\n" 和 tf->epc；
-   - 读取 tf->epc 处 2 字节，若低 2 位 == 0b11，则 tf->epc += 4，否则 += 2；
-2. cause == 3（断点）：
-   - 打印 "Breakpoint at 0x%016lx\n" 和 tf->epc；
-   - 按同样的规则推进 tf->epc；
-3. 其他 cause：
-   - 调用 print_trapframe(tf)，不修改 tf->epc；
-4. 函数返回后，由 __trapret 的 RESTORE_ALL 把 tf->epc 写回 sepc，再 sret。
-
-失败/边界：
-- 若 tf->epc 指向的指令是 16 位压缩指令，必须只加 2；加 4 会落到指令中间；
-- 若 cause 不是 2/3，不得推进 epc，否则会掩盖未修复的异常；
-- 本实验不要求处理 48/64 位长指令，也不要求处理缺页等异常的恢复；
-- 不得假设 tf->epc 一定 4 字节对齐（压缩指令只保证 2 字节对齐）；
-- 不要读 4 字节来判断长度，只读 2 字节，避免跨页读到未映射页。
-
-验收：
-1. make 编译通过（-Werror）；
-2. ebreak 测试：打印一次 "Breakpoint at ..."，返回后继续执行，不刷屏；
-3. 非法指令测试：打印一次 "Illegal instruction at ..."，返回后继续执行；
-4. 未知异常测试：打印 trapframe，cause 字段正确；
-5. 若条件允许，用 c.ebreak 验证 16 位指令走 +2 分支。
-````
-
-> 完整提示词套件（主实现 / 测试生成 / 代码审查）见 [prompt.md](./prompt.md)。报告里只放主实现提示词。
-
-##### 实现代码
-
-```c
-//lab3 function2 2510538
-
-/* 一条指令占几个字节。
- * RISC-V 的 32 位指令低 2 位固定为 0b11，16 位压缩指令低 2 位一定不是 0b11。
- * 读 epc 处的半个字，看低 2 位就能判断，不需要完整解码。
- * 本实验只涉及 16/32 位指令；更长的编码不在处理范围内。 */
-static inline size_t insn_len(uintptr_t epc) {
-    return (*(const uint16_t *)(uintptr_t)epc & 0x3) == 0x3 ? 4 : 2;
-}
-
-/* 异常处理：非法指令、断点、其他。
- * 函数签名由实验框架规定；框架测试代码以 extern 方式引用，因此不能加 static。 */
-void exception_handler(struct trapframe *tf) {
-    switch (tf->cause) {
-    case CAUSE_ILLEGAL_INSTRUCTION:
-        cprintf("Illegal instruction at 0x%016lx\n", tf->epc);
-        // 跳过这条指令，否则 sret 回来会再触发同一异常，形成死循环
-        tf->epc += insn_len(tf->epc);
-        break;
-
-    case CAUSE_BREAKPOINT:
-        cprintf("Breakpoint at 0x%016lx\n", tf->epc);
-        tf->epc += insn_len(tf->epc);
-        break;
-
-    default:
-        // 实验未要求具体处理的异常：打印完整 trapframe 兜底，不推进 epc。
-        print_trapframe(tf);
-        break;
-    }
-}
-```
-
-##### 实现迭代过程
-
-本模块经历了 3 次主要迭代。
-
-###### 第一次迭代：固定 `+4`，遇到 `c.ebreak` 失败
+##### 第一次迭代
 
 **遇到的问题：**
 
-- 第一版把所有异常都写成 `tf->epc += 4`。
-- 用 32 位 `ebreak` 测试时正常，因为 `ebreak` 正好 4 字节。
-- 换成 16 位 `c.ebreak` 后，输出变成：
-
-```text
-before c.ebreak
-Breakpoint at 0xffffffffc02000a0
-Illegal instruction at 0xffffffffc02000a4
-Breakpoint at 0xffffffffc02000a0
-Illegal instruction at 0xffffffffc02000a4
-...
-```
-
-- 原因：`c.ebreak` 在 `0xa0`，只占 2 字节，下一条有效指令在 `0xa2`；`+4` 跳到 `0xa4`，落在 `0xa2` 那条 32 位指令的中间，解码成非法指令，形成循环。
+1. **`proc_run` 想偷懒用 `lsatp()`**：`libs/riscv.h` 里确实有个 `lsatp(pgdir)`，看起来就是“设置页表”。但它写的是 `SATP32_MODE | (pgdir >> RISCV_PGSHIFT)`，其中 `SATP32_MODE = 0x80000000`——那是 Sv32 的 MODE 位，Sv39 的 MODE 是值为 8 的 4 位字段、要放在 bit 63..60。直接用会导致 satp 里 MODE 字段完全错误。
+2. **`schedule` 的轮转起点**：第一版用 `&proc_list` 作为起点，逻辑上“从头找”看着没问题，但这样就**没有从 current 的下一个开始轮转**，`idleproc` 会一直被优先选中，调度不公平；若改成 `&current->list_link`，当 `current == idleproc` 时这个节点根本不在链表里，`list_next` 会走进野指针。
+3. **`switch_to` 差点照搬 lab3 的结论**：lab3 的 `RESTORE_ALL` 有一条铁律“sp 必须最后恢复”，第一版注释里也这么写了。但那是**因为 `RESTORE_ALL` 以 sp 为基址**；`switch_to` 的基址是 `a0`/`a1`，sp 只是被存取的数据之一，不存在这个约束。
 
 **问题解决策略：**
 
-- 在 `[SPECIFICATION]` 中增加“16 位压缩指令低 2 位不是 `0b11`”的边界；
-- 增加 `insn_len()`：读 `epc` 处 2 字节，低 2 位 `0b11` 返回 4，否则返回 2；
-- 用 `c.ebreak` 重新验证，输出 `before` → `Breakpoint at 0xa0` → `after`。
+- 针对 1：在 `[RELY]` 里明确写“`lsatp()` 是 Sv32 遗留写法，禁止使用；照 `enable_paging()` 自己拼 satp”，并在生成后逐字核对 `SATP_MODE_SV39 << 60`。
+- 针对 2：在 `[SPECIFICATION]` 里把起点写成 `last = (current == idleproc) ? &proc_list : &(current->list_link)`，并说明“idleproc 不在 proc_list 里”。
+- 针对 3：在 `[RELY]` 里补上“`switch_to` 的存取基址是 a1，不是 sp”，并在注释里写明“这里没有 sp 最后恢复的约束”。
 
-###### 第二次迭代：`static` 导致链接失败
+---
+
+##### 第二次迭代
 
 **遇到的问题：**
 
-- 把 `exception_handler` 写成 `static void exception_handler(...)`。
-- 注入 `GRADE_LAB3_ILLEGAL` 测试后链接失败：
-
-```text
-kern/test/test_lab3.c:30:(.text.test_lab3_handler_fallbacks+0x2e):
-    undefined reference to `exception_handler'
-```
-
-- 原因：测试代码在另一个编译单元里用 `extern` 引用它，`static` 让符号只在本文件可见。
+1. **`need_resched` 没有清零**：第一版 `schedule` 忘了 `current->need_resched = 0`，结果线程一被切过去就发现“有人请求调度”，立刻又切走，形成空转（现象是 `runs` 疯涨、几乎没有实际执行）。
+2. **临界区只包住了 `proc_run`**：第一版把 `local_intr_save` 放在 `proc_run` 里，而“选谁”这一步在临界区之外。理论上选完线程、切换之前来一次时钟中断，中断里的 `schedule` 可能改掉 `current`，造成 `current` 与实际现场不一致。
 
 **问题解决策略：**
 
-- 去掉 `static`，保持外部链接；
-- 在 `[GUARANTEE]` 中明确写“不要加 static”。
+- 针对 1：在 `[SPECIFICATION]` 的 `schedule` 步骤里显式加上“先清 `need_resched`”，并解释原因（避免刚切回来又被切出去）。
+- 针对 2：把临界区扩大到整个 `schedule`（选 + 切），`proc_run` 内部再保留自己的一层，形成“外层保证选择与切换的原子性、内层保证切换本身的原子性”。
 
-###### 第三次迭代：输出字符串与验收脚本不匹配
+---
+
+##### 第三次迭代
 
 **遇到的问题：**
 
-- 输出写成 `Breakpoint!` / `Illegal instruction!`。
-- 测试函数内部仍然打印 PASS，但 `grade.sh` 的 sentinel 是 `"Breakpoint at"` / `"Illegal instruction at"`，匹配不到，整项判 0。
+本地 QEMU 10 上，内核跑到 `check_pgdir() succeeded!` 之后就像“重启”了一样，输出 `DTB Init / HartID: 256 ...`，最后 `panic at pmm.c:105`。一开始怀疑是自己的 `proc_run` 切 satp 切坏了。
 
-**问题解决策略：**
+**排查过程（这部分记录在 5.3 与本段）：**
 
-- 把输出改成 `Breakpoint at 0x...` / `Illegal instruction at 0x...`；
-- 在 `[SPECIFICATION]` 的验收里写明输出必须包含的关键字。
+1. `qemu -d int` 抓 trap：真正出错的是 `store_page_fault, tval=0x100`，位置在 `check_boot_pgdir()` 的 `strcpy((void *)0x100, str)`——发生在**调度之前**，说明与模块三无关；
+2. 当时 `stvec` 还是 0（`idt_init()` 在 `pmm_init()` 之后），于是 PC 跳到 0；VA 0 与 0x100 同页且已被映射成数据页，CPU 把数据当指令执行，最终乱跳到 `kern_entry`，表现为“重启”；
+3. 用 gdb 在 `strcpy` 前把三级页表逐级读出来，叶子 PTE 是 `0x...c7`（V|R|W|A|D 都在），**映射本身有效**；
+4. 怀疑过 A/D 位（QEMU 10 需要 `menvcfg.ADUE=1` 才由硬件置位），补上 `PTE_A|PTE_D` 后仍然缺页，排除；
+5. 最终定位：框架 `get_pte()` 给**非叶子**页表项写了 `PTE_U`，而 RISC-V 规范要求非叶子 PTE 的 D/A/U 保留位清零；QEMU 10 检查这一点，QEMU 4.1.1 不检查。
 
-###### 最终结果
+**最终结果：**
 
 经过 3 次迭代，该模块最终：
 
-- 编译通过（`-Werror`）；
-- 上下文/断点测试通过（35/35）；
-- 非法指令/兜底测试通过（25/25）；
-- 持续时钟测试通过（40/40，`ticks=200`）；
-- 额外用 `c.ebreak` 验证了 `+2` 分支。
+- ✅ 编译通过（`-Werror`，无警告）
+- ✅ `[Test PMM]`、`[Test Process Create]`、`[Test Schedule]` 三项全部 PASS
+- ✅ `initproc` 成功运行并打印 `Hello world!!`
+- ✅ 连跑 3 次结果稳定
 
 **关键改进点总结：**
 
-1. 在 `[RELY]` 中补充了 RISC-V 16/32 位指令编码规则，避免 AI 按“一条指令 4 字节”猜；
-2. 在 `[SPECIFICATION]` 中明确了“未知异常不推进 `epc`”的失败路径；
-3. 在 `[GUARANTEE]` 中补充了“非 static”“输出关键字”“`-Werror`”三条硬约束。
+1. 在 `[RELY]` 中补充了 `copy_thread` 设置的“路标”（`context.ra/sp`、`tf->epc`），让 AI 明白“为什么 ret 会跑到 forkret”；
+2. 在 `[SPECIFICATION]` 中把 `schedule` 的起点分情况和 `need_resched` 清零写成显式步骤；
+3. 在 `[RELY]` 中把 `lsatp()` 标为禁用项，避免了 Sv32/Sv39 混用；
+4. 明白了“本地 QEMU 跑不通”与“代码写错”是两件事：**先用 `-d int` 定位 trap，再判断是软件还是模拟器差异**，并且不为了本地跑通去改 `Makefile`/`tools/`。
 
 ---
 
-### 4.3 模块之间的衔接
+### 4.4 Challenge
 
-```text
-异常/中断发生
-  ↓
-硬件：sepc、scause、sstatus 就绪，跳到 stvec
-  ↓
-__alltraps：SAVE_ALL，形成 trapframe，调用 trap(tf)
-  ↓
-trap() → trap_dispatch(tf)
-  ↓
-cause 最高位 1 → interrupt_handler（邓翔予）
-cause 最高位 0 → exception_handler（张铭瑞）
-  ↓
-处理函数返回
-  ↓
-__trapret：RESTORE_ALL，把 tf->epc 写回 sepc，恢复寄存器
-  ↓
-sret：PC = sepc，继续执行
-```
+**负责人：** 2510538-张铭瑞
+
+> 由负责人补充。
 
 ---
 
 ## 五、测试与验证
 
-> 文本记录来自同一份代码在 QEMU 8.2.2 上的运行结果；现场演示由徐康怀在 QEMU 4.1.1 上完成。
+### 5.1 页表相关测试
 
-### 5.1 编译与时钟中断
+> 由负责人补充（预期输出 `check_alloc_page() succeeded!`、`check_pgdir() succeeded!`、`check_boot_pgdir() succeeded!`、`[Test PMM] PASS`）。
 
-```bash
-cd lab3
-make clean
-make
-make qemu
+### 5.2 进程创建测试
+
+> 由负责人补充（预期输出 `[Test Process Create] PASS`，且 `idleproc->pid == 0`、`initproc->pid == 1`）。
+
+### 5.3 调度测试（模块三）
+
+**测试方式**：`tools/inject.py` 会把 `test_lab4_schedule()` 注入到 `init_main()` 的**开头**。它做三件事：
+
+1. 先断言 `current == idleproc`、`idleproc->pid == 0`、`initproc->pid == 1`；
+2. 用 `kernel_thread()` 再创建两个线程，每个线程循环 `need_resched = 1; schedule();`；
+3. 自己在 `init_main` 里连续 8 次 `schedule()`，最后断言“两个线程都真的执行过”，打印 `[Test Schedule] PASS`。
+
+**实测输出**（本地 QEMU 10.2 + xpack 工具链，注入官方测试）：
+
 ```
-
-关键输出（省略 OpenSBI banner）：
-
-```text
-memory management: best_fit_pmm_manager
-physcial memory map:
-  memory: 0x0000000008000000, [0x0000000080000000, 0x0000000087ffffff].
 check_alloc_page() succeeded!
-satp virtual address: 0xffffffffc0205000
-satp physical address: 0x0000000080205000
+check_pgdir() succeeded!
+check_boot_pgdir() succeeded!
+kmalloc_init() succeeded!
+[Test PMM] PASS
+check_vma_struct() succeeded!
+check_vmm() succeeded.
+[Test Process Create] PASS
 ++ setup timer interrupts
-100 ticks
-100 ticks
-100 ticks
-100 ticks
-100 ticks
-100 ticks
-100 ticks
-100 ticks
-100 ticks
-100 ticks
+[Test Schedule] PASS            ← 模块三的验收点
+this initproc, pid = 1, name = "init"
+To U: "Hello world!!".
+To U: "en.., Bye, Bye. :)"
+kernel panic at kern/process/proc.c: process exit!!.
 ```
 
-10 行 `100 ticks` 对应 `SHUTDOWN_AFTER=10`，每行间隔约 1 秒（`TICK_NUM=100`，每次 10 ms），说明时钟中断被持续重新设置。
+**结果判读：**
 
-### 5.2 上下文/断点测试
+- `[Test Schedule] PASS` 说明：`cpu_idle → schedule → proc_run → switch_to → forkret → forkrets → __trapret → sret → kernel_thread_entry` 这整条链路是通的，而且**能来回切**（两个新线程都被执行过）；
+- 紧随其后的 `process exit!!` 是**预期行为**：`init_main` 返回后 `kernel_thread_entry` 会 `jal do_exit`，lab4 的 `do_exit` 就是 `panic`；
+- 连跑 3 次，三项 PASS 与 initproc 三行输出稳定出现（`3/3`、`1/1`），说明不是偶然。
 
-```text
-Breakpoint at 0xffffffffc02019b4
-[Test 1] Trap entry and breakpoint return: PASS (35/35)
-```
+**测试截图：**
 
-验证点：
-
-- `ebreak` 前设置的 26 个寄存器特征值，返回后逐个比较，全部一致；
-- `RESTORE_ALL` 的偏移、顺序、`sp` 最后恢复都正确；
-- `exception_handler` 对 32 位 `ebreak` 推进 4 字节，返回后不会重复执行。
-
-### 5.3 非法指令与兜底测试
-
-```text
-Illegal instruction at 0xffffffffc0201966
-Supervisor software interrupt
-Unknown interrupt: cause 15
-trapframe at 0xffffffffc0204eb0
-...
-  cause    0x00000014
-[Test 2] handler fallback completed\n[Test 2] Illegal instruction return: PASS (25/25)
-```
-
-验证点：
-
-- `.word 0x0000007b`（4 字节）触发非法指令，打印一次，`epc += 4` 后返回；
-- `interrupt_handler()` 对软件中断、未知中断（15）有输出；
-- `exception_handler()` 对未知异常（20）调用 `print_trapframe()`，输出 `cause 0x00000014`，不推进 `epc`。
-
-> 输出里的 `\n` 是测试源码中的字面量，不是运行错误；sentinel 仍能匹配。
-
-### 5.4 持续时钟测试
-
-```text
-++ setup timer interrupts
-100 ticks
-100 ticks
-[Test 3] Sustained supervisor timer: PASS (40/40, ticks=200)
-100 ticks
-...
-```
-
-`ticks=200` 说明时钟中断不是只来一次，而是被 `clock_set_next_event()` 持续重新设置。
-
-### 5.5 16 位压缩断点测试
-
-为了验证 `insn_len()` 的 `+2` 分支，在 `kern_init()` 中临时插入：
-
-```c
-cprintf("before c.ebreak\n");
-asm volatile(".option push\n.option rvc\nc.ebreak\n.option pop");
-cprintf("after c.ebreak\n");
-```
-
-运行结果：
-
-```text
-before c.ebreak
-Breakpoint at 0xffffffffc02000a0
-after c.ebreak
-```
-
-反汇编：
-
-```text
-ffffffffc02000a0:  9002        ebreak        # c.ebreak，2 字节
-ffffffffc02000a2:  ...                       # 下一条指令
-```
-
-`epc=0xa0`，返回后执行 `0xa2`，说明 `insn_len()` 返回 2，`tf->epc += 2` 正确。如果固定 `+4`，会跳到 `0xa4` 的指令中间，触发非法指令循环，永远到不了 `after`。
-
-> 该测试只用于验证，验证后已从最终源码删除。
-
-### 5.6 测试覆盖情况
-
-| 测试 | 来源 | 覆盖 | 没覆盖 |
-|---|---|---|---|
-| 上下文/断点 | 框架 `test_lab3_context.S` + `test_lab3.c` | 入口/恢复、32 位 `ebreak`、`+4` | 16 位指令、未知异常 |
-| 非法指令/兜底 | 框架 `test_lab3.c` | 32 位非法指令、`+4`、`default` 打印 | 真实缺页恢复 |
-| 持续时钟 | 框架 `test_lab3.c` | 时钟重设、`ticks` 累计 | 外部设备中断 |
-| `c.ebreak` | 本人临时测试 | 16 位压缩指令、`+2` | 寄存器恢复、48/64 位指令 |
-
-### 5.7 关于 `make grade`
-
-本机 QEMU 8.2.2 下，`make grade` 使用：
-
-```bash
-qemu-system-riscv64 ... -bios default -device loader,file=bin/ucore.img,addr=0x80200000
-```
-
-OpenSBI 的 `Domain0 Next Address` 是 `0x0`，CPU 从 0 取指，内核不打印，三项测试全 0。用等价的 `-kernel bin/ucore.img` 启动后，注入的三项测试全部通过。这是本机 QEMU 版本与课程脚本的启动方式差异，不是 `trap.c` 的逻辑错误；提交的 `tools/` 未改动。
+> 提交前在此插入 **QEMU 4.1.1 上 `make grade`** 的实际截图（4.1.1 上无需任何临时补丁）。上面的文本输出是本地 QEMU 10.2 的等价结果，供比对。
 
 ---
 
 ## 六、实验总结与收获
 
-### 6.1 对操作系统的理解
+### 对操作系统的理解
 
-| 实验中的概念 | 对应的 OS 原理 | 含义、关系与差异 |
+**1. 本实验的重要知识点，与 OS 原理的对照**
+
+| 本实验的知识点 | OS 原理中的对应 | 关系与差异 |
 |---|---|---|
-| Trap（中断 + 异常） | 中断/异常机制、陷入内核 | 实验用 `scause` 最高位区分；原理课通常把中断、异常、系统调用分开讲，RISC-V 统一为 Trap |
-| `stvec` + `__alltraps` | 中断向量表、陷阱入口 | 实验用 Direct 模式，所有 Trap 共用一个入口；x86 有 IDT、不同向量对应不同处理程序 |
-| `struct trapframe` + `SAVE_ALL`/`RESTORE_ALL` | 上下文保存/恢复、PCB 中的现场 | 实验保存的是一次 Trap 的现场，不是进程切换的完整上下文；真实 OS 还要保存页表基址、浮点寄存器、信号掩码等 |
-| `sepc` / `sret` | 精确异常、返回地址 | 异常是同步的，`sepc` 指向出错指令；中断是异步的，`sepc` 指向被打断的指令。是否推进 `epc` 取决于“这条指令是否已经处理完” |
-| `sstatus.SPP/SPIE/SIE` | 特权级切换、中断嵌套 | 实验只做 S 模式内的 Trap，没有 U 模式；真实 OS 还要处理用户态/内核态栈切换、嵌套中断 |
-| `sscratch` | 内核栈/用户栈切换 | 实验用 `sscratch` 暂存旧 `sp`；真实 OS 常把 `sscratch` 指向内核栈，用于从 U 模式陷入时切换栈 |
-| 时钟中断 + `sbi_set_timer` | 时钟驱动、时间片、抢占式调度 | 实验只做“计数 + 打印 + 关机”；真实 OS 会在时钟中断里递减时间片、触发调度 |
-| 指令长度与 `epc` 修正 | 指令解码、精确异常 | 实验只处理 16/32 位；真实 CPU 还可能有 48/64 位指令、向量指令 |
-| `print_trapframe` | 内核调试、崩溃现场 | 实验用它兜底；真实 OS 会打印寄存器、栈回溯、进程信息，甚至生成 core dump |
+| `switch_to` 保存 `ra/sp/s0~s11` | 上下文切换（context switch） | 原理讲“切换要保存/恢复 CPU 现场”；实验把“现场”具体化为 14 个寄存器，并能解释为什么只存这 14 个（调用约定） |
+| `proc_run` 切 `current` + 切 `satp` | 进程切换（process switch） | 原理里“进程切换 = 换页表 + 换寄存器”；实验里两者被拆成两步，且内核线程共享 `boot_pgdir`，页表切换看起来“没变”但语义上仍要执行 |
+| `schedule` 的轮转扫描 | 调度算法（RR） | 原理讲优先级、时间片、多级队列；实验只实现最简单的轮转，且是**协作式**（靠 `need_resched` 主动让出），不是抢占式 |
+| `local_intr_save/restore` | 临界区 / 互斥 | 原理讲锁、信号量；单核内核里“关中断”是最轻量的互斥手段，代价是屏蔽所有中断 |
+| `idleproc` | 空闲任务（Idle） | 原理里 idle 是最低优先级进程；实验里它直接复用启动现场，`kstack = bootstack`，没有走 `fork` |
+| `forkret → forkrets → __trapret → sret` | 新进程的首次运行 / fork 的返回点 | 原理讲“子进程从 fork 返回 0”；实验用“构造 trapframe + 让 sret 跳进去”伪造这个返回点，`tf->gpr.a0 = 0` 就是“子进程看到返回 0” |
+| `flush_tlb()` 与 `satp` | 页表基址寄存器与 TLB | 原理讲 TLB 是页表的缓存；实验必须在改 `satp` 后显式 `sfence.vma`，否则可能命中旧翻译 |
 
-OS 原理中很重要、但本实验没有覆盖的知识点：
+**2. OS 原理中很重要、但本实验没有对上的知识点**
 
-1. **用户态与内核态的切换**：本实验的 Trap 都发生在 S 模式，没有 U 模式程序，也没有 `ecall` 系统调用。
-2. **进程与调度**：时钟中断只计数，没有 `schedule()`；真实 OS 会在时钟中断里更新时间片、选择下一个进程、切换页表和寄存器。
-3. **缺页异常与按需分页**：本实验对缺页只打印 trapframe，不修复；真实 OS 要查页表、分配物理页、从磁盘换入、修改 PTE，再重新执行指令。
-4. **嵌套中断与中断优先级**：本实验进入 Trap 后硬件清 `SIE`，处理期间不再响应中断；真实 OS 可能允许高优先级中断嵌套，需要 PLIC 和屏蔽策略。
-5. **多核与每 CPU 状态**：本实验是单 hart；真实多核系统里，`sscratch`、`stvec`、`sp` 都是每 CPU 的，Trap 处理还要考虑核间同步。
-6. **浮点/向量上下文**：`trapframe` 只保存 32 个通用寄存器；真实 OS 还要保存浮点寄存器、向量寄存器。
-7. **信号产生与投递**：异常在真实 OS 里可能转化为信号（如 SIGILL、SIGTRAP），本实验只打印。
-8. **外部设备中断的完整管理**：本实验只处理 S 模式时钟中断，没有外部设备中断的使能、屏蔽、优先级、EOI 流程。
+1. **抢占式调度与时间片**：lab4 的调度是协作式的，时钟中断只推进 `ticks`，并没有在中断里强制调度。
+2. **调度算法的评价与实现**：优先级调度、多级反馈队列、CFS、实时调度（EDF/RM）都没有涉及。
+3. **用户态进程与地址空间隔离**：lab4 只创建内核线程，`copy_mm` 是空壳，没有 `fork` 一个真正独立的用户地址空间。
+4. **进程同步与通信**：信号量、管程、条件变量、死锁避免（lab7 才有）。
+5. **上下文切换的开销分析**：实验关心“能不能切对”，没有测切换耗时、缓存/TLB 抖动、调度器的吞吐与延迟。
+6. **进程的完整生命周期**：`do_exit` 在 lab4 里直接 `panic`，没有僵尸进程回收、没有 `wait` 语义。
+7. **多核（SMP）调度**：实验是单 hart，没有负载均衡、CPU 亲和性、IPI 唤醒。
 
-### 6.2 AI 协作开发的经验
+### AI 协作开发的经验
 
-1. **Spec 的价值在“边界”和“失败路径”**：这次 `+4` 的 bug 不是 AI “不会写”，而是提示词没有把“16 位压缩指令”这个边界写进去。把边界写成可判定的规则（低 2 位是否为 `0b11`）后，代码才正确。
-2. **`RELY` 必须写真实定义，不能凭印象**：`struct trapframe` 的字段顺序、`CAUSE_*` 的值、`sret` 的行为，都要从代码/手册里抄，不能写“大概是”。AI 不会自动知道这个工程的布局。
-3. **验收标准要可执行**：不要写“输出正确信息”，而要写“输出包含 `Breakpoint at`，且只打印一次”。这样生成的代码才能被脚本/人工稳定验证。
-4. **AI 的输出必须自己跑测试**：三项注入测试、`c.ebreak` 测试、反汇编对照，都是“验证 AI 产出”的一部分。只看代码“看起来对”不够，必须让 CPU 真的跑一遍。
-5. **环境问题要和代码问题分开**：`make grade` 全 0 一开始很像代码 bug，但 `make qemu` 正常 + `-d int` 看到 `epc=0` 后，才能定位到是 `-device loader` 的启动方式问题。先分层（编译/启动/测试/代码），再逐层排除。
-6. **不要替组员讲他们的模块**：答辩按分工来，自己只讲自己写过的函数；被问到别人的模块，说明“这部分是组员负责的”，不要硬答。
+1. **把“机制事实”写进 `[RELY]`，比写十句“请仔细”更有效。** 例如“`context.ra` 是 `forkret`”“`pgdir` 是物理地址”“`lsatp()` 是 Sv32 遗留”，这些都是 AI 靠猜会猜错、写进提示词就一次到位的东西。
+2. **提示词要按“实现 / 验证 / 审查”拆开。** 一个提示词里既要功能正确、又要顺手写测试，AI 往往两头都做不扎实；拆开之后，问题能精确定位到“是代码错了”还是“验证方法错了”。
+3. **AI 生成的汇编和页表代码，必须自己拿“机器码/页表项”对一遍。** 这次 `satp` 的拼法、`switch_to` 的寄存器清单，都是靠对着 `enable_paging()` 和 `struct context` 逐字核对才确认的。
+4. **“本地跑不通”不等于“代码错了”。** 第三次迭代的教训很典型：先用 `-d int` 抓 trap、再用 gdb 读页表，才把“环境差异”和“实现 bug”分开；也因此没有为了让本地跑通去改 `Makefile` / `tools/`——那会埋下“课程环境反而挂”的雷。
+5. **模块之间的接口要写下来。** 模块二把 `context.ra`/`context.sp`/`tf->epc` 摆好，模块三才能“跳过去”；这些约定不写清楚，联调时就会互相怀疑。
